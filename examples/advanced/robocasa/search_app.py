@@ -221,15 +221,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--trace", default="", help="write the JSONL trace to this path as well"
     )
+    parser.add_argument(
+        "--backend",
+        default="mock",
+        choices=["mock", "robocasa"],
+        help="mock needs nothing installed; robocasa needs the simulator and assets",
+    )
+    parser.add_argument(
+        "--layout", type=int, default=1, help="RoboCasa kitchen layout id (robocasa backend)"
+    )
+    parser.add_argument(
+        "--containers", type=int, default=4, help="how many drawers to search (robocasa backend)"
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    trace = run_episode(
-        scene_id=args.scene, seed=args.seed, policy_name=args.policy
-    )
+    if args.backend == "robocasa":
+        from .search_robocasa_world import RoboCasaSearchWorld
+
+        world = RoboCasaSearchWorld(layout_id=args.layout, max_containers=args.containers)
+        scene = world.build_scene(scene_id=f"robocasa_layout{args.layout}")
+        trace = run_episode(
+            scene=scene, seed=args.seed, policy_name=args.policy, world=world
+        )
+    else:
+        trace = run_episode(
+            scene_id=args.scene, seed=args.seed, policy_name=args.policy
+        )
     print(trace.render())
     if args.trace:
         print(f"\nwrote {trace.write(args.trace)}")
