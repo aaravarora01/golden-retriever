@@ -376,6 +376,7 @@ demo-pi05-mock = { cmd = "python -m examples.advanced.openpi_policy.app --mode m
 demo-robosuite-mock = { cmd = "python -m examples.advanced.robocasa.robosuite_lift --mode mock --steps 20 --dt 0.05", env = { PYTHONPATH = "." } }
 demo-robocasa-mock = { cmd = "python -m examples.advanced.robocasa.app --mode mock --steps 14", env = { PYTHONPATH = "." } }
 demo-robocasa-search-mock = { cmd = "python -m examples.advanced.robocasa.search_app", env = { PYTHONPATH = "." } }
+demo-robocasa-search-metrics = { cmd = "python -m examples.advanced.robocasa.search_metrics --seeds 200", env = { PYTHONPATH = "." } }
 demo-pipeline-html-viz = { cmd = "python examples/experimental/visualization/visualize_pipeline.py", env = { PYTHONPATH = "." } }
 public-surface-check = { cmd = "python scripts/release/check_public_surface.py", env = { PYTHONPATH = "." } }
 demo-hierarchical-vla = { cmd = "python examples/advanced/hierarchical_vla/app.py --backend multiprocessing", env = { PYTHONPATH = "." } }
