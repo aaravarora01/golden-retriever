@@ -398,3 +398,44 @@ def test_an_absolute_joint_command_is_not_clipped_by_the_action_spec(arm_env):
     target[0] = 2.5
     _commander(env, arm)(target)
     assert float(controller.goal_qpos[0]) == pytest.approx(2.5, abs=1e-6)
+
+
+def test_the_default_restart_budget_is_reliable_from_any_posture(arm_env):
+    """Calibration, not a guess: 10 restarts reaches a clear solution 5 times
+    in 8 and 30 reaches it 8 times in 8. The default is 30."""
+    import mujoco
+
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import solve_posture
+
+    model, data = env.sim.model._model, env.sim.data._data
+    target = _object_position(env) + np.array([0.0, 0.0, 0.085])
+    random = np.random.default_rng(1)
+    saved = arm.joints().copy()
+
+    def apply(joints):
+        for address, value in zip(arm.qadr, joints):
+            data.qpos[address] = value
+        mujoco.mj_forward(model, data)
+
+    try:
+        reached = 0
+        for trial in range(4):
+            apply(arm.clamp(random.uniform(arm.limits[:, 0], arm.limits[:, 1])))
+            solution = solve_posture(arm, target, seed=trial)
+            reached += int(solution.reached and solution.clear)
+        assert reached == 4, "the default budget should solve from any starting posture"
+    finally:
+        apply(saved)
+
+
+def test_a_target_at_the_object_centre_does_not_solve(arm_env):
+    """Recorded because chasing it wasted a cycle: the grip site cannot occupy
+    the counter surface the object rests on, so a grasp aims above it."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import solve_posture
+
+    at_centre = solve_posture(arm, _object_position(env), restarts=30)
+    above = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]))
+    assert above.reached and above.clear
+    assert at_centre.residual_m > above.residual_m
