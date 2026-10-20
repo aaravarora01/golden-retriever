@@ -16,11 +16,8 @@ from __future__ import annotations
 import argparse
 
 from .study_methods import RandomMethod, StillMethod
-from .study_sweep import DEFAULT_SEEDS, MethodSpec, Sweep, render
-
-#: Tasks whose initial reach was measured; see STUDY.md for why none is
-#: arm-reachable without commanding the base.
-DEFAULT_TASKS = ("PickPlaceCounterToCabinet", "PickPlaceCabinetToCounter")
+from .study_sweep import MethodSpec, Sweep, render
+from .study_tasks import DEFAULT_SEEDS, ablation_subset, get_task, list_tasks
 
 
 def baseline_specs(horizon: int, representation: str) -> tuple:
@@ -39,7 +36,11 @@ def baseline_specs(horizon: int, representation: str) -> tuple:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="study-pnp")
     parser.add_argument("--task", action="append", dest="tasks", default=None,
-                        help="RoboCasa task; repeatable. Defaults to two measured ones.")
+                        help="Committed task name; repeatable. Defaults to a reach-spread subset.")
+    parser.add_argument("--all-tasks", action="store_true",
+                        help="Run all 18 committed tasks instead of the subset.")
+    parser.add_argument("--subset", type=int, default=4,
+                        help="Size of the reach-spread subset when no task is named.")
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS),
                         help="Episode seeds. The study uses 0-4.")
     parser.add_argument("--horizon", type=int, default=5,
@@ -57,10 +58,15 @@ def main(argv=None) -> int:
             task=task, representation=representation,
             command_base=representation == "eef_delta_base")
 
-    sweep = Sweep(build_environment=build,
-                  tasks=tuple(args.tasks or DEFAULT_TASKS),
-                  seeds=tuple(args.seeds), max_steps=args.max_steps)
     try:
+        if args.tasks:
+            tasks = tuple(get_task(name).task for name in args.tasks)
+        elif args.all_tasks:
+            tasks = list_tasks()
+        else:
+            tasks = ablation_subset(args.subset)
+        sweep = Sweep(build_environment=build, tasks=tasks,
+                      seeds=tuple(args.seeds), max_steps=args.max_steps)
         summary = sweep.run(baseline_specs(args.horizon, args.representation))
     except (ValueError, TypeError, OSError) as error:
         print(render({"error": f"{type(error).__name__}: {error}"}))

@@ -550,3 +550,96 @@ def test_the_default_seeds_are_the_studys_protocol():
     from examples.advanced.robocasa.study_sweep import DEFAULT_SEEDS
 
     assert DEFAULT_SEEDS == (0, 1, 2, 3, 4)
+
+
+# --- the committed task suite -------------------------------------------
+
+
+def test_the_suite_accounts_for_every_registered_environment():
+    """38 registered `PickPlace*`/`Place*` environments, each in exactly one
+    bucket, so nothing was dropped silently."""
+    from examples.advanced.robocasa.study_tasks import (
+        MISSING_ASSET_TASKS, MULTI_OBJECT_TASKS, NON_KITCHEN_TASKS, PNP_TASKS)
+
+    buckets = (tuple(task.task for task in PNP_TASKS), MULTI_OBJECT_TASKS,
+               NON_KITCHEN_TASKS, MISSING_ASSET_TASKS)
+    names = [name for bucket in buckets for name in bucket]
+    assert len(names) == 38
+    assert len(set(names)) == 38, "a task appears in two buckets"
+    assert len(PNP_TASKS) == 18
+
+
+def test_every_committed_task_carries_its_measured_reach_and_goal():
+    from examples.advanced.robocasa.study_tasks import PNP_TASKS
+
+    for task in PNP_TASKS:
+        assert task.goal.strip() and task.goal.endswith(".")
+        assert 0.3 <= task.initial_reach_m <= 0.9
+
+
+def test_no_committed_task_is_arm_reachable():
+    """The measurement that bounds the whole lane: a capped Cartesian
+    controller stalls near 0.29 m and the nearest object starts at 0.305 m, so
+    a policy that does not command the base cannot engage any task."""
+    from examples.advanced.robocasa.study_tasks import ARM_STALL_DISTANCE_M, PNP_TASKS
+
+    assert not any(task.arm_reachable for task in PNP_TASKS)
+    assert min(task.initial_reach_m for task in PNP_TASKS) > ARM_STALL_DISTANCE_M
+
+
+def test_an_unscorable_task_explains_itself_rather_than_404ing():
+    from examples.advanced.robocasa.study_tasks import get_task
+
+    with pytest.raises(ValueError, match="no single `obj`"):
+        get_task("PlaceVegetablesEvenly")
+    with pytest.raises(ValueError, match="bin-picking"):
+        get_task("PickPlaceCan")
+    with pytest.raises(ValueError, match="objs_objaverse"):
+        get_task("PickPlaceCounterToOven")
+    with pytest.raises(ValueError, match="available:"):
+        get_task("NoSuchTask")
+
+
+def test_the_ablation_subset_spreads_across_the_reach_range():
+    """A subset that was accidentally all-near or all-far would measure
+    something other than the suite, since reach decides whether a policy can
+    engage the object at all."""
+    from examples.advanced.robocasa.study_tasks import ablation_subset, get_task
+
+    subset = ablation_subset(6)
+    assert len(subset) == len(set(subset)) == 6
+    reaches = [get_task(name).initial_reach_m for name in subset]
+    assert max(reaches) - min(reaches) > 0.3
+
+
+@pytest.mark.parametrize("count", (0, -1, 19, 1.0, True))
+def test_an_unusable_subset_size_is_rejected(count):
+    from examples.advanced.robocasa.study_tasks import ablation_subset
+
+    with pytest.raises(ValueError):
+        ablation_subset(count)
+
+
+def test_the_layout_is_pinned_and_one_based():
+    from examples.advanced.robocasa.study_tasks import LAYOUT_ID, STYLE_ID
+
+    assert LAYOUT_ID >= 1 and STYLE_ID >= 1
+
+
+def test_the_seeds_are_the_studys_protocol():
+    from examples.advanced.robocasa.study_tasks import DEFAULT_SEEDS
+
+    assert DEFAULT_SEEDS == (0, 1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("bad", (
+    {"task": "NotATask", "goal": "g.", "initial_reach_m": 0.5},
+    {"task": "PickPlaceX", "goal": "   ", "initial_reach_m": 0.5},
+    {"task": "PickPlaceX", "goal": "g.", "initial_reach_m": 0.0},
+    {"task": "PickPlaceX", "goal": "g.", "initial_reach_m": 5.0},
+))
+def test_an_unusable_task_entry_is_rejected(bad):
+    from examples.advanced.robocasa.study_tasks import PnPTask
+
+    with pytest.raises(ValueError):
+        PnPTask(**bad)
