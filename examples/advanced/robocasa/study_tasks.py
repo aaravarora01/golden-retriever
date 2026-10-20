@@ -165,3 +165,68 @@ def ablation_subset(count: int = 8) -> tuple:
     ordered = sorted(PNP_TASKS, key=lambda task: task.initial_reach_m)
     step = len(ordered) / count
     return tuple(ordered[int(index * step)].task for index in range(count))
+
+
+# --- the task-specification axis -----------------------------------------
+#
+# The study ablates how the task is specified: default language, vague language,
+# or a video demonstration. The first two are available here.
+#
+# `default` is RoboCasa's own goal string, which names the object and both
+# fixtures: "Pick the sugar cube from the counter and place it in the cabinet."
+#
+# `vague` is derived from the environment name rather than authored per task, so
+# no instruction here is invented text. `PickPlaceCounterToCabinet` yields "Move
+# the object from the counter to the cabinet." — it keeps the fixtures and drops
+# the object identity, which is the information a vague instruction withholds. A
+# name that does not split into source and destination falls back to a generic
+# instruction, and the fallback is reported rather than hidden, because a task
+# whose vague form carries no fixtures is a different condition from one that
+# does.
+#
+# A video-demonstration condition is not implemented: it needs recorded
+# demonstrations, and the dataset links for this RoboCasa revision are dead (see
+# STUDY.md).
+
+SPECIFICATION_STYLES = ("default", "vague")
+
+_FIXTURE_WORDS = {
+    "Counter": "counter", "Cabinet": "cabinet", "Sink": "sink", "Microwave": "microwave",
+    "Stove": "stove", "Drawer": "drawer", "Blender": "blender", "StandMixer": "stand mixer",
+    "Toaster": "toaster", "ToasterOven": "toaster oven", "FridgeShelf": "fridge shelf",
+    "FridgeDrawer": "fridge drawer", "Oven": "oven", "Shelf": "shelf", "Pot": "pot",
+}
+
+
+def _split_fixtures(name: str):
+    """Split `PickPlace<Source>To<Destination>` into its two fixture words."""
+    if not name.startswith("PickPlace") or "To" not in name:
+        return None
+    stem = name[len("PickPlace"):]
+    for index in range(len(stem) - 1, 0, -1):
+        if stem[index:index + 2] == "To":
+            source, destination = stem[:index], stem[index + 2:]
+            if source in _FIXTURE_WORDS and destination in _FIXTURE_WORDS:
+                return _FIXTURE_WORDS[source], _FIXTURE_WORDS[destination]
+    return None
+
+
+def specification(task, style: str = "default") -> dict:
+    """The instruction a policy receives, and whether it is the derived one.
+
+    Returns the text plus `derived`, so a run records which condition produced
+    it rather than leaving a reader to infer the condition from the wording.
+    """
+    if style not in SPECIFICATION_STYLES:
+        raise ValueError(f"style must be one of {SPECIFICATION_STYLES}")
+    entry = task if isinstance(task, PnPTask) else get_task(task)
+    if style == "default":
+        return {"text": entry.goal, "style": "default", "derived": False,
+                "names_object": True}
+    fixtures = _split_fixtures(entry.task)
+    if fixtures is None:
+        return {"text": "Move the object to where it belongs.", "style": "vague",
+                "derived": True, "names_object": False, "fallback": True}
+    source, destination = fixtures
+    return {"text": f"Move the object from the {source} to the {destination}.",
+            "style": "vague", "derived": True, "names_object": False, "fallback": False}

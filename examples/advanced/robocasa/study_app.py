@@ -48,6 +48,9 @@ def main(argv=None) -> int:
     parser.add_argument("--representation", default="eef_delta",
                         help="Action representation; eef_delta_base commands the mobile base.")
     parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--specification", choices=("default", "vague"), default="default",
+                        help="Task-specification axis: RoboCasa's goal, or the derived "
+                             "instruction that withholds the object's identity.")
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -56,7 +59,8 @@ def main(argv=None) -> int:
     def build(task, representation):
         return RoboCasaPnPEnvironment(
             task=task, representation=representation,
-            command_base=representation == "eef_delta_base")
+            command_base=representation == "eef_delta_base",
+            specification_style=args.specification)
 
     try:
         if args.tasks:

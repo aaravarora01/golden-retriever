@@ -122,10 +122,14 @@ class RoboCasaPnPEnvironment:
     #: Expose the 3-wide base segment to the policy. Required for any task whose
     #: object starts outside the arm's workspace, which is all of them so far.
     command_base: bool = False
+    #: The study's task-specification axis: RoboCasa's own goal string, or the
+    #: derived instruction that withholds the object's identity.
+    specification_style: str = "default"
     env: object = None
     codec: EefDeltaCodec | None = None
     progress: ProgressTracker = field(default_factory=ProgressTracker)
     prompt: str = ""
+    specification: dict = field(default_factory=dict)
     _frames: list = field(default_factory=list)
     _last_success: bool = False
     _last_raw: dict = field(default_factory=dict)
@@ -140,6 +144,10 @@ class RoboCasaPnPEnvironment:
             raise ValueError("layout_id must be an int of 1 or more; 0 is not a LayoutType")
         if type(self.style_id) is not int or self.style_id < 1:
             raise ValueError("style_id must be an int of 1 or more")
+        from .study_tasks import SPECIFICATION_STYLES
+
+        if self.specification_style not in SPECIFICATION_STYLES:
+            raise ValueError(f"specification_style must be one of {SPECIFICATION_STYLES}")
 
     # --- the harness Protocol ------------------------------------------
 
@@ -163,7 +171,18 @@ class RoboCasaPnPEnvironment:
         self.progress = ProgressTracker()
         self._frames = []
         self._last_success = False
-        self.prompt = str(self.env.get_ep_meta().get("lang") or self.task)
+        # The instruction a policy receives is an axis, not a fixed string. The
+        # default style is RoboCasa's own goal; `vague` withholds the object
+        # identity. The environment's own text is kept as the fallback so a task
+        # outside the committed suite still runs.
+        from .study_tasks import specification
+
+        try:
+            self.specification = specification(self.task, self.specification_style)
+        except ValueError:
+            self.specification = {"text": str(self.env.get_ep_meta().get("lang") or self.task),
+                                  "style": "default", "derived": False, "names_object": True}
+        self.prompt = self.specification["text"]
         self._track(raw)
         return self._observation(raw)
 
@@ -279,4 +298,5 @@ class RoboCasaPnPEnvironment:
                 "representation": self.representation, "exposed_dof": EXPOSED_DOF,
                 "observation": self.observation.to_dict(),
                 "command_base": self.command_base,
+                "specification": dict(self.specification),
                 "frozen_segments": ["torso"] if self.command_base else ["base", "torso"]}

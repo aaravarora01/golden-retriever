@@ -1226,3 +1226,68 @@ def test_the_prompt_axes_are_wired_but_not_live():
         method = _direct(OfflineModelClient(method=StillMethod(horizon=5)), config=config)
         answers.add(method.predict(observation).actions.tobytes())
     assert len(answers) == 1, "the offline client is supposed to ignore the configuration"
+
+
+# --- the task-specification axis ----------------------------------------
+
+
+def test_the_default_specification_is_robocasas_own_goal():
+    from examples.advanced.robocasa.study_tasks import get_task, specification
+
+    task = get_task("PickPlaceCounterToCabinet")
+    spec = specification(task, "default")
+    assert spec["text"] == task.goal
+    assert spec["derived"] is False and spec["names_object"] is True
+
+
+def test_the_vague_specification_is_derived_and_withholds_the_object():
+    """Derived from the environment name rather than authored, so no
+    instruction in this lane is invented text."""
+    from examples.advanced.robocasa.study_tasks import specification
+
+    spec = specification("PickPlaceCounterToCabinet", "vague")
+    assert spec["text"] == "Move the object from the counter to the cabinet."
+    assert spec["derived"] is True and spec["names_object"] is False
+    assert spec["fallback"] is False
+    # The object identity is exactly what it withholds.
+    assert "sugar" not in spec["text"]
+
+
+def test_the_vague_form_keeps_the_fixtures_for_nearly_every_task():
+    """A vague instruction that carried no fixtures would be a different
+    condition, so the fallback has to be rare and reported."""
+    from examples.advanced.robocasa.study_tasks import PNP_TASKS, specification
+
+    fallbacks = [task.task for task in PNP_TASKS
+                 if specification(task, "vague").get("fallback")]
+    assert len(fallbacks) == 1 and fallbacks == ["PickPlaceCoffee"]
+
+
+def test_a_task_without_a_source_and_destination_falls_back_and_says_so():
+    from examples.advanced.robocasa.study_tasks import specification
+
+    spec = specification("PickPlaceCoffee", "vague")
+    assert spec["fallback"] is True and spec["names_object"] is False
+
+
+def test_an_unknown_specification_style_is_rejected():
+    from examples.advanced.robocasa.study_tasks import specification
+
+    with pytest.raises(ValueError, match="style must be one of"):
+        specification("PickPlaceCounterToCabinet", "interpretive_dance")
+
+
+def test_the_environment_rejects_an_unknown_specification_style():
+    with pytest.raises(ValueError, match="specification_style"):
+        RoboCasaPnPEnvironment(specification_style="mime")
+
+
+def test_every_committed_task_has_both_specification_styles():
+    from examples.advanced.robocasa.study_tasks import (
+        PNP_TASKS, SPECIFICATION_STYLES, specification)
+
+    for task in PNP_TASKS:
+        texts = {style: specification(task, style)["text"] for style in SPECIFICATION_STYLES}
+        assert all(text.strip() for text in texts.values())
+        # The two conditions must differ, or the axis does nothing.
+        assert texts["default"] != texts["vague"]

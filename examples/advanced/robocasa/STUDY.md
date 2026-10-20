@@ -9,7 +9,8 @@ on a GPU machine without being rewritten.
 ```bash
 pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
-pixi run -e robocasa test-robocasa-study   # simulator-free, 74 tests
+pixi run -e robocasa study-pnp-vague       # the task-specification axis
+pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
 ```
 
 ## What this is not
@@ -40,8 +41,12 @@ the model-call count, so neither had to be invented.
 | `study_observation` | Views and history tiled into one `PolicyObservation` |
 | `study_progress` | The 0–100 partial score RoboCasa does not provide |
 | `study_methods` | `StillMethod` and `RandomMethod`, the two baselines |
-| `study_scripted` | A privileged waypoint reference (incomplete; see below) |
+| `study_scripted` | A privileged waypoint reference (blocked; see below) |
 | `study_sweep` | task × seed × method, with the three counts kept apart |
+| `study_tasks` | The 18-task committed suite and the specification axis |
+| `study_telemetry` | Latency, tokens and cost, beside the results not in them |
+| `study_transcript` | Record and replay calls keyed by prompt digest |
+| `study_model` | The model call boundary and the three policy forms |
 
 ## Axis coverage
 
@@ -51,9 +56,11 @@ the model-call count, so neither had to be invented.
 | Action horizon | `horizon` on a method; chunk rows per call | Live — trades control steps against model calls |
 | Observation content | `ObservationConfig.views` | Live |
 | Observation history | `ObservationConfig.history` | Live |
-| Prompt content / model / effort | — | Needs a model |
-| Direct / Agentic / Orchestrated | — | Needs a model |
-| 120 tasks × 5 episodes, seeds 0–4 | 2 measured tasks × seeds 0–4 | Protocol matches; task count does not |
+| Task specification | `default` vs derived `vague` | Live |
+| Prompt content / model / effort / horizon band | `ModelConfig`, hashed into the prompt | **Wired, not live** — needs a model to move behaviour |
+| Direct / Agentic / Orchestrated | `study_model`'s three methods | Mechanisms live; a result needs a model |
+| 120 tasks × 5 episodes, seeds 0–4 | 18 committed tasks × seeds 0–4 | Protocol matches; this is the ablation-suite scale |
+| Video demonstration | — | Needs demonstrations; the dataset links are dead |
 
 Metrics follow the study: success rate, a 0–100 `Score`, per-call latency, and
 **model calls per episode**. Control steps, model calls and episodes are three
@@ -88,8 +95,8 @@ flat action vector it takes 7 *absolute joint* targets plus a gripper, which is
 `joint_position`; its `ik_input_ref_frame` is `mobilebase0_base`, so nothing
 there is a world-frame pose target.
 
-**Freezing the base makes these tasks unsolvable.** Across the ten pick-and-place
-tasks tried, the object starts 0.33–0.66 m from the end-effector. A Cartesian
+**Freezing the base makes these tasks unsolvable.** Across the eighteen
+committed tasks the object starts 0.305–0.878 m from the end-effector. A Cartesian
 controller driven straight at it stalls — 0.337 m under OSC with an aggressive
 gain, 0.288 m with the per-step cap applied correctly — with no joint at a limit.
 The cause is orientation rather than reach: `init_robot_base_ref` places the base
@@ -102,23 +109,90 @@ froze the base measured something other than what it claimed.
 
 ## Baseline results
 
-Two tasks × seeds 0–4, 200-step cap, horizon 5, `eef_delta`. Numbers live in the
-PR description rather than here, but the shape is the point: both baselines
+Numbers live in the PR description rather than here, but the shape is the point: both baselines
 report a 0.00 success rate and a 0 score with no rung reached, 200 control steps
 against 40 model calls, and the random method saturates the per-step cap on every
 row while the still method never touches it. That is what the baselines are for —
 the floor is a real floor, the scorer credits nothing that did not happen, and the
 clip ledger separates a policy that constantly saturates from one that does not.
 
+## The model seam
+
+`study_model` is the boundary a frontier model plugs into, shaped after
+`fast_downward.py` in the sibling drawer harness: a serializable config with
+explicit bounds, a status enum rather than exceptions for expected outcomes, and
+the response captured whole. A non-ok status, an oversize answer, an unparseable
+answer, a chunk outside the configured horizon band and a transport exception
+are one thing from the harness's side — no dispatchable chunk — so each becomes
+a refusal that is recorded before it is raised.
+
+No provider is shipped, so the default test path needs no key.
+`OfflineModelClient` answers from a wrapped method, which is what lets the whole
+path run in CI. Supplying a provider is one class:
+
+```python
+class MyProvider(ModelClient):
+    def __init__(self):
+        self.client = ...   # construct the SDK client here, never at import time
+
+    def complete(self, prompt, config):
+        try:
+            reply = ...     # one call, honouring config.timeout_seconds
+        except TimeoutError:
+            return ModelResponse(status=ModelCallStatus.TIMEOUT, detail="...")
+        return ModelResponse(text=reply.text, model_id=config.model_id,
+                             prompt_tokens=reply.usage.input_tokens,
+                             completion_tokens=reply.usage.output_tokens,
+                             usd=..., latency_s=...)
+```
+
+The three forms differ as the study defines them. **Direct** is stateless.
+**Agentic** carries a window of its own prior calls, which is what the
+context-history axis ablates; at memory 0 it is informationally Direct, which is
+stated in the contract and pinned by a test rather than reported as a
+difference. **Orchestrated** reviews a base method's fixed 15-step proposal and
+either accepts it or substitutes a shorter segment, recording every review so
+the intervention rate is readable; a reviewer that cannot answer falls back to
+the proposal rather than failing the episode.
+
+**The prompt-shaped axes are wired, not live.** The prompt variant, model id,
+reasoning effort and horizon band all enter the hashed prompt, so each provably
+changes the digest and two configurations cannot collide on one transcript
+entry. Whether a model's behaviour changes with them is unknowable without a
+model, and the offline client ignores the configuration by design — so a sweep
+over variants against it returns identical rows, which is a tautology rather
+than a null result. The tests assert both halves on purpose.
+
+`record_into` banks successful calls so one paid sweep replays offline for free
+thereafter. A refused call is not banked: a transcript of answers that do not
+parse would replay as refusals and read as a model failure rather than a
+recording failure.
+
 ## What is incomplete, and why
 
-**`study_scripted` does not solve a task.** It reaches, descends, grasps, lifts
-and releases from privileged object pose, and it obeys the same per-step caps a
-model policy would, but it stalls in `approach_above` for the reason above: these
-tasks need base navigation, which is a control problem of its own rather than
-harness work. It is committed because the phase machine, the privileged channel
-and the chunk planning are the parts a working expert will reuse, and because its
-stall is the evidence for the reach finding.
+**No policy reaches a nonzero success rate, and the obstacle is control rather
+than measurement.** `study_scripted` reaches, descends, grasps, lifts and
+releases from privileged object pose under the study's per-step caps, but it
+stalls in `approach_above`. Base navigation was then built and probed, and these
+are the measurements:
+
+* Yawing the base to face the object **works** — bearing 0.43 → −0.026 rad, the
+  object ends dead ahead in the base frame.
+* Driving forward **does not close range** — 0.534 m → 0.515 m. The base is
+  already against the counter, and `[1,0,0]` moves the end-effector +0.024 m in
+  twenty steps while `[-1,0,0]` moves it 0.684 m: forward is blocked.
+* `OSC_POSE` stalls at 0.337 m with an aggressive gain and 0.288 m with the cap
+  applied correctly, no joint at a limit.
+* `WHOLE_BODY_IK`'s 7-wide `right` segment is an IK target the solver converts,
+  not joint pass-through — commanding element 0 alone moves all seven joints —
+  and all three documented layouts (position with zero rotation, position with
+  axis-angle, position with quaternion) reach 0.32 m transiently then diverge to
+  about 1.44 m.
+
+So a working reference needs genuine Jacobian or IK integration against the
+whole-body controller, not waypoint scripting. The phase machine, the privileged
+channel and the chunk planning are committed because a working expert reuses
+them.
 
 **Demonstration replay is blocked upstream.** The obvious way to get a reference
 without writing a controller is to replay RoboCasa's human demonstrations. The
