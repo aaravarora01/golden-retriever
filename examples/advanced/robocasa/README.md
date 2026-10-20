@@ -243,3 +243,7 @@ This is a recorded-demonstration replay, not a learned-policy benchmark.
 GoldenRetriever contains the typed Flows, adapters, runnable examples, and
 public documentation. Large assets, downloaded datasets, recordings, and
 machine-specific caches remain outside version control.
+
+## Policy study
+
+[Policy study on pick-and-place](STUDY.md) reproduces the Astranomy measurement design on RoboCasa's pick-and-place suite, with the RoboLab-120 backend behind the same Protocol for a GPU run.
