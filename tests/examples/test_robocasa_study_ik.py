@@ -509,3 +509,119 @@ def test_the_orientation_restart_budget_is_wider_than_the_default(arm_env):
     from examples.advanced.robocasa.study_ik import ORIENTATION_RESTARTS
 
     assert ORIENTATION_RESTARTS >= 150
+
+
+# --- the planner endpoint invariant --------------------------------------
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2, 3))
+def test_a_planned_path_runs_from_the_start_to_the_goal(arm_env, seed):
+    """The invariant whose absence hid a real bug. The bidirectional
+    reconstruction depended on which tree grew last, so on some iterations the
+    path did not end at the goal — and a follower then reported success against
+    whatever endpoint it was handed, while the arm sat 3 rad away."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import DOWN, plan_path, solve_posture
+
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]),
+                         restarts=60, approach=DOWN, seed=seed)
+    if not (goal.reached and goal.clear):
+        pytest.skip("no clear posture for this seed")
+    path = plan_path(arm, goal.joints, seed=seed)
+    assert path.found
+    assert np.allclose(path.waypoints[0], arm.joints(), atol=1e-9)
+    assert np.allclose(path.waypoints[-1], goal.joints, atol=1e-9)
+
+
+# --- chained stages ------------------------------------------------------
+
+
+def test_a_stage_validates_the_gripper_not_the_joints(arm_env):
+    """A stage can land its joint target while the hand is elsewhere — that is
+    how a silent failure propagated into the next stage."""
+    env, arm = arm_env
+    env.reset()
+    arm = type(arm)(env=env)
+    from examples.advanced.robocasa.study_ik import DOWN, reach
+
+    target = _object_position(env) + np.array([0.0, 0.0, 0.085])
+    outcome = reach(arm, target, command=_commander(env, arm), approach=DOWN)
+    assert outcome.arrived, outcome.to_dict()
+    assert outcome.residual_m == pytest.approx(
+        float(np.linalg.norm(target - arm.hand())), abs=1e-9)
+
+
+def test_a_stage_reports_why_it_failed(arm_env):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import reach
+
+    # A target beyond the workspace cannot be solved, and the stage says so
+    # rather than reporting a bare failure.
+    outcome = reach(arm, np.array([5.0, 5.0, 5.0]), command=_commander(env, arm),
+                    attempts=1, restarts=5)
+    assert not outcome.arrived
+    assert "reaches the target" in outcome.reason or "contact" in outcome.reason
+
+
+@pytest.mark.parametrize("bad", ({"tolerance": 0.0}, {"tolerance": 1.0},
+                                  {"attempts": 0}, {"attempts": 21}))
+def test_an_unusable_stage_setting_is_rejected(arm_env, bad):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import reach
+
+    with pytest.raises(ValueError):
+        reach(arm, arm.hand(), command=_commander(env, arm), **bad)
+
+
+@pytest.fixture
+def clean_env():
+    """A fresh environment, because a pick depends on the object's exact pose.
+
+    The module-scoped fixture has been stepped by every test before it, and a
+    reset does not reproduce the same object placement, so a grasp tuned to one
+    pose does not transfer. Slow, and the only honest way to test a pick.
+    """
+    import robocasa  # noqa: F401 - registers the task suite
+    import robosuite
+
+    from examples.advanced.robocasa.study_ik import ArmModel, joint_position_controller_config
+
+    env = robosuite.make(TASK, robots="PandaOmron",
+                         controller_configs=joint_position_controller_config(),
+                         has_renderer=False, has_offscreen_renderer=False,
+                         use_camera_obs=False, seed=0, layout_ids=[1], style_ids=[1])
+    env.reset()
+    yield env, ArmModel(env=env)
+    env.close()
+
+
+def test_the_chained_pipeline_picks_the_object_up(clean_env):
+    """The end-to-end result: approach, descend, close, lift. Reaching was
+    solved earlier; this is the grasp, and it needed the planner endpoint fix,
+    orientation selection and a grasp height inside the object rather than
+    above it."""
+    env, arm = clean_env
+    from examples.advanced.robocasa.study_ik import DOWN, reach
+
+    start = _object_position(env)
+
+    def grasped():
+        return bool(env._check_grasp(gripper=env.robots[0].gripper["right"],
+                                     object_geoms=env.objects["obj"].contact_geoms))
+
+    assert reach(arm, start + np.array([0.0, 0.0, 0.085]),
+                 command=_commander(env, arm), approach=DOWN).arrived
+    descend = reach(arm, start + np.array([0.0, 0.0, 0.012]),
+                    command=_commander(env, arm), approach=DOWN)
+    assert descend.arrived, descend.to_dict()
+    assert descend.tilt_deg < 25.0, descend.to_dict()
+    close = _commander(env, arm, grip=1.0)
+    for _ in range(260):
+        close(arm.joints())
+    assert grasped(), "the fingers should close on the object at this height"
+    lift = reach(arm, np.array([arm.hand()[0], arm.hand()[1], start[2] + 0.16]),
+                 command=close, approach=DOWN, tolerance=0.05)
+    assert lift.arrived, lift.to_dict()
+    risen = float(_object_position(env)[2] - start[2])
+    assert risen > 0.05, f"the object should leave the counter, rose {risen:.4f}"
+    assert grasped(), "and still be held at the top of the lift"

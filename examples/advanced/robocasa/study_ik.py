@@ -535,14 +535,28 @@ def plan_path(arm: ArmModel, goal, *, iterations: int = 4000, step: float = PLAN
                 index = parent[index]
             return path
 
-        forward = chain(trees[active], parents[active], grown)[::-1]
-        backward = chain(trees[other], parents[other], reached)
-        waypoints = forward + backward if active == 0 else (backward + forward[::-1])[::-1]
+        # Tree 0 is rooted at the start and tree 1 at the goal, so name the
+        # connecting node on each side explicitly rather than reasoning about
+        # which tree happened to grow last. Getting this wrong produced paths
+        # that did not end at the goal on odd iterations, which made every
+        # downstream measurement depend on the parity of the connecting step.
+        start_side = grown if active == 0 else reached
+        goal_side = reached if active == 0 else grown
+        waypoints = (chain(trees[0], parents[0], start_side)[::-1]
+                     + chain(trees[1], parents[1], goal_side))
         raw = len(waypoints)
         if smooth:
             waypoints = _shortcut(cache, waypoints, random)
-        return PlannedPath(waypoints=[np.asarray(point) for point in waypoints],
-                           iterations=iteration, found=True, smoothed_from=raw)
+        points = [np.asarray(point) for point in waypoints]
+        # A path that does not run from the start to the goal is worse than no
+        # path, because a follower reports success against whatever endpoint it
+        # was handed. Checked rather than assumed.
+        if (not np.allclose(points[0], start, atol=1e-9)
+                or not np.allclose(points[-1], goal, atol=1e-9)):
+            raise AssertionError(
+                "planned path does not run from the start posture to the goal")
+        return PlannedPath(waypoints=points, iterations=iteration, found=True,
+                           smoothed_from=raw)
     finally:
         cache.restore()
 
@@ -668,3 +682,97 @@ def follow_path(arm: ArmModel, waypoints, *, command, increment: float = FOLLOW_
 # ill-conditioned that way. A two-stage approach — solve position, then rotate
 # within the nullspace of the position task — is the next thing to try, and is
 # recorded here rather than guessed at again.
+
+
+# --- chaining stages reliably ---------------------------------------------
+#
+# One solve-plan-follow to a single target is repeatable. Three in sequence were
+# not: the same pipeline produced a 0.0012 m final distance on one invocation
+# and 0.4865 m on the next, because every stage begins from wherever the last
+# one left the arm, which changes both the IK seed and the tree the planner
+# grows from. A stage that quietly fails hands a bad posture onward and the
+# next stage plans from somewhere unintended.
+#
+# `reach` closes that by validating each stage against the thing that actually
+# matters — where the gripper ended up — and retrying from the arm's real
+# posture when it did not arrive. `FollowReport.stalled` was already the signal
+# and was simply never checked.
+
+#: Hand-position error, in metres, at which a stage counts as arrived.
+STAGE_TOLERANCE = 0.01
+#: Attempts per stage before giving up. Each retry re-solves and re-plans from
+#: the arm's current posture with a fresh seed, so a retry is a genuinely
+#: different attempt rather than the same one repeated.
+STAGE_ATTEMPTS = 4
+
+
+@dataclass
+class StageOutcome:
+    """One stage of a chained reach, and why it ended as it did."""
+
+    target: object = None
+    attempts: int = 0
+    arrived: bool = False
+    residual_m: float = 0.0
+    tilt_deg: float = 0.0
+    obstructions: int = 0
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {"attempts": self.attempts, "arrived": self.arrived,
+                "residual_m": round(self.residual_m, 5),
+                "tilt_deg": round(self.tilt_deg, 2),
+                "obstructions": self.obstructions, "reason": self.reason}
+
+
+def reach(arm: ArmModel, target, *, command, approach=None, tolerance: float = STAGE_TOLERANCE,
+          attempts: int = STAGE_ATTEMPTS, restarts: int | None = None,
+          planner_iterations: int = 6000) -> StageOutcome:
+    """Solve, plan and follow to one Cartesian target, retrying on failure.
+
+    Validation is on the *gripper's* position rather than on joint error,
+    because a stage can land its joint target while the hand is somewhere else
+    — that was how a silent failure propagated. A retry re-solves and re-plans
+    from the arm's current posture with a new seed, which is what makes it a
+    different attempt rather than a repeat of the same one.
+    """
+    if type(tolerance) is not float or not 0.0 < tolerance <= 0.5:
+        raise ValueError("tolerance must be a float in (0, 0.5]")
+    if type(attempts) is not int or not 1 <= attempts <= 20:
+        raise ValueError("attempts must be an int from 1 through 20")
+    target = np.asarray(target, dtype=float)
+    budget = restarts if restarts is not None else (
+        ORIENTATION_RESTARTS if approach is not None else 30)
+    outcome = StageOutcome(target=target)
+    for attempt in range(1, attempts + 1):
+        outcome.attempts = attempt
+        solution = solve_posture(arm, target, restarts=budget, seed=attempt - 1,
+                                 approach=approach)
+        if not solution.reached:
+            outcome.reason = f"no posture reaches the target (residual {solution.residual_m:.4f})"
+            continue
+        if not solution.clear:
+            outcome.reason = f"solved posture is in {solution.obstructions} contact(s)"
+            continue
+        path = plan_path(arm, solution.joints, seed=attempt - 1,
+                         iterations=planner_iterations)
+        if not path.found:
+            outcome.reason = "no collision-free path to the solved posture"
+            continue
+        report = follow_path(arm, path.waypoints, command=command)
+        residual = float(np.linalg.norm(target - arm.hand()))
+        if report.stalled:
+            outcome.reason = f"following stalled with {residual:.4f} m remaining"
+            continue
+        if residual > tolerance:
+            outcome.reason = f"followed the path but ended {residual:.4f} m away"
+            continue
+        outcome.arrived = True
+        outcome.residual_m = residual
+        outcome.tilt_deg = float(np.degrees(arm.tilt_from(DOWN)))
+        outcome.obstructions = report.worst_obstructions
+        outcome.reason = ""
+        return outcome
+    outcome.residual_m = float(np.linalg.norm(target - arm.hand()))
+    outcome.tilt_deg = float(np.degrees(arm.tilt_from(DOWN)))
+    return outcome
