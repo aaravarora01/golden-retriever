@@ -11,6 +11,7 @@ pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
 pixi run -e robocasa study-pnp-vague       # the task-specification axis
 pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
+pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 15 tests
 ```
 
 ## What this is not
@@ -47,6 +48,7 @@ the model-call count, so neither had to be invented.
 | `study_telemetry` | Latency, tokens and cost, beside the results not in them |
 | `study_transcript` | Record and replay calls keyed by prompt digest |
 | `study_model` | The model call boundary and the three policy forms |
+| `study_ik` | Damped-least-squares IK, posture solving, droop compensation |
 
 ## Axis coverage
 
@@ -189,10 +191,34 @@ are the measurements:
   axis-angle, position with quaternion) reach 0.32 m transiently then diverge to
   about 1.44 m.
 
-So a working reference needs genuine Jacobian or IK integration against the
-whole-body controller, not waypoint scripting. The phase machine, the privileged
-channel and the chunk planning are committed because a working expert reuses
-them.
+Jacobian IK was then built (`study_ik`), and it moved the diagnosis twice.
+
+**The object is reachable from the robot's existing base position.** Brute-force
+sampling of arm postures finds one within 0.052 m without moving the base, and
+`solve_posture` refines that to a residual of 0.0008 m with zero obstructions,
+confirmed by independent forward kinematics. The arm's position Jacobian is full
+rank at the start posture, so the controller's stall was never a kinematic
+limit. **The base-navigation theory above is therefore wrong**, and it is left in
+place because it was the working hypothesis for several of the measurements.
+
+**What blocks a reference policy is motion planning, not reaching.** The start
+posture and the goal posture are both collision-free; the straight line between
+them is not. The arm self-collides at reset (`link5` against the gripper hand)
+and the gripper wedges under `cab_1_main_group_bottom` along the way, and
+commanding the goal directly leaves the shoulder pitch and elbow 0.400 and 0.598
+rad short. That is physical blocking rather than control error: integral
+correction drives the other five joints to 0.002 rad and those two do not move,
+which is exactly what `DroopCompensator.wound_up` reports.
+
+Closing it needs a collision-checked planner in joint space — MuJoCo supplies
+the collision queries and `solve_posture` supplies the goal configurations, so
+the remaining work is the planner itself. Three facts about commanding this arm
+are recorded in `study_ik` because none is in any documentation: the arm takes
+absolute joint targets only once the body-part controller is reconfigured to
+`JOINT_POSITION`, which widens the action vector to 13; `output_max` clips the
+absolute target, so it must span the joint ranges or a commanded posture is
+silently truncated; and the controller droops under gravitational load, which
+integral correction fixes wherever the path is clear.
 
 **Demonstration replay is blocked upstream.** The obvious way to get a reference
 without writing a controller is to replay RoboCasa's human demonstrations. The

@@ -207,6 +207,7 @@ study-pnp-baselines = { cmd = "python -m examples.advanced.robocasa.study_app --
 study-pnp-sweep = { cmd = "python -m examples.advanced.robocasa.study_app", env = { PYTHONPATH = "." } }
 study-pnp-vague = { cmd = "python -m examples.advanced.robocasa.study_app --specification vague --summary-only", env = { PYTHONPATH = "." } }
 test-robocasa-study = { cmd = "python -m pytest -q tests/examples/test_robocasa_study.py", env = { PYTHONPATH = "." } }
+test-robocasa-study-ik = { cmd = "python -m pytest -q tests/examples/test_robocasa_study_ik.py", env = { PYTHONPATH = "." } }
 test-robocasa-launcher = { cmd = "python -m pytest -q tests/examples/test_robocasa_launcher.py", env = { PYTHONPATH = "." } }
 test-robocasa-replay-data = { cmd = "python -m pytest -q tests/examples/test_robocasa_replay_data.py", env = { PYTHONPATH = ".", RUN_ROBOCASA_DATA_TESTS = "1" } }
 robosuite-setup-macros = "python -m robosuite.scripts.setup_macros"
