@@ -257,6 +257,17 @@ orientation either. That solve is ill-conditioned; a two-stage approach — solv
 position, then rotate within the nullspace of the position task — is the next
 thing to try, and is recorded rather than guessed at a second time.
 
+The second obstacle is that *chaining* stages is not yet reliable. A single
+solve-plan-follow is: the committed test reaches a planned point to under a
+centimetre, repeatably. Three in sequence are not — the same pipeline produced a
+0.0012 m final distance on one invocation and 0.4865 m on the next, because each
+stage starts from wherever the previous one left the arm, which changes both the
+IK seed and the tree the planner grows. `FollowReport.stalled` is the signal; a
+stalled stage needs retrying or re-planning rather than handing a bad posture
+onward. Follow parameters are also less forgiving than they look — tightening
+`tolerance` from 0.05 to 0.04 made a stage stall against its tick budget instead
+of tracking more accurately — so the committed defaults are the measured ones.
+
 The superseded diagnosis follows, kept because it was the working hypothesis for
 several of the measurements above. With the planned path followed waypoint by waypoint,
 the gripper reaches z = 1.022 against a 1.024 target — the height was never
