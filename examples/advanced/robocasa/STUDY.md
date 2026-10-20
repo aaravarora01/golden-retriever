@@ -11,7 +11,7 @@ pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
 pixi run -e robocasa study-pnp-vague       # the task-specification axis
 pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
-pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 35 tests
+pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 43 tests
 ```
 
 ## What this is not
@@ -244,20 +244,38 @@ fixed time schedule runs away from it, leaving the arm up to 0.8 rad behind and
 colliding with things the kinematic check called clear. Gating the advance on
 the arm keeping up is what makes the executed motion follow the verified path.
 
-**What is left is the grasp, not the reach.** A second solve-and-follow descends
-to about 3 cm of the object and the fingers do not close on it. The likely cause
-is orientation, which nothing in the solver constrains — `solve_posture` uses the
-position Jacobian only, so a solved posture is free to rotate the gripper away
-from the top-down approach the reset posture starts in, where the grip site's z
-axis points within 8 degrees of straight down. A first combined
-position-and-orientation solve made it worse rather than better: weighting the
-rotational error at 0.6 against position in one damped solve left a 0.41 m
-position error against 0.0008 m position-only, and did not achieve the
-orientation either. That solve is ill-conditioned; a two-stage approach — solve
-position, then rotate within the nullspace of the position task — is the next
-thing to try, and is recorded rather than guessed at a second time.
+**Orientation is solved, and the fix was not the one expected.**
 
-The second obstacle is that *chaining* stages is not yet reliable. A single
+| target | selection | restarts | position error | tilt from vertical | clear |
+| --- | --- | --- | --- | --- | --- |
+| 8.5 cm above | none | 30 | 0.0001 m | 49.1° | yes |
+| 8.5 cm above | top-down | 200 | 0.0003 m | **13.6°** | yes |
+| 2.5 cm above | none | 30 | 0.0001 m | 56.1° | **no** |
+| 2.5 cm above | top-down | 200 | 0.0020 m | **11.9°** | yes |
+
+With seven joints and a three-axis position target the solution manifold is
+four-dimensional, and across restarts the gripper orientation spans 13° to 159°.
+So a solve that ignores orientation returns whichever posture it landed on —
+measured at 49–56° off vertical — while near-vertical postures were in the
+search all along. Scoring orientation when *selecting* among position-accurate
+restarts finds them, at a cost of under two millimetres of position, and at
+grasp height it also turns a colliding solution into a clear one.
+
+Steering orientation *inside* the solve was tried first and all three variants
+were worse. A weighted second task costs position outright: 0.39 m against
+0.0008 m. Projecting into the nullspace of the position task does not help
+either — the exact projector leaks nothing (`‖Jp·N‖ = 0` with a true
+pseudoinverse, against 0.003 per step with a damped one), but the clamped joint
+motion no longer preserves position, and clipping the two tasks separately did
+not recover it. Selection among restarts needs none of that machinery.
+
+The restart budget bounds what orientation is findable: 60 restarts settled for
+34.4° where 200 reached 13.6°, so `ORIENTATION_RESTARTS` is wider than the
+default that suffices for position alone. Clear solutions also thin out near the
+object — 27 of 200 at the approach height against 4 of 200 at grasp height.
+
+**What is left is the grasp itself, and the chaining.** A second solve-and-follow descends
+to about 3 cm of the object and the fingers do not close on it. The remaining obstacle is that *chaining* stages is not yet reliable. A single
 solve-plan-follow is: the committed test reaches a planned point to under a
 centimetre, repeatably. Three in sequence are not — the same pipeline produced a
 0.0012 m final distance on one invocation and 0.4865 m on the next, because each

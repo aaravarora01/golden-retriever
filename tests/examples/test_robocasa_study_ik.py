@@ -439,3 +439,73 @@ def test_a_target_at_the_object_centre_does_not_solve(arm_env):
     above = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]))
     assert above.reached and above.clear
     assert at_centre.residual_m > above.residual_m
+
+
+# --- orientation selection ------------------------------------------------
+
+
+def test_the_reset_posture_already_points_nearly_down(arm_env):
+    """Which is why top-down is the right grasp to aim for: the robot starts
+    within 8 degrees of it."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import DOWN
+
+    assert np.degrees(arm.tilt_from(DOWN)) < 10.0
+
+
+def test_position_only_solving_points_the_gripper_anywhere(arm_env):
+    """The defect orientation selection exists for. With seven joints and a
+    three-axis target the solution manifold is four-dimensional, so a solve
+    that ignores orientation returns whichever posture it landed on."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import solve_posture
+
+    solution = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]))
+    assert solution.reached
+    assert solution.tilt_deg > 30.0, solution.to_dict()
+
+
+def test_requesting_an_approach_direction_finds_a_near_vertical_posture(arm_env):
+    """The fix, and the measurement: 13.6 degrees off vertical at the approach
+    height with sub-millimetre position error and no collisions, against 49
+    degrees without selection."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import (
+        DOWN, ORIENTATION_RESTARTS, solve_posture)
+
+    solution = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]),
+                             restarts=ORIENTATION_RESTARTS, approach=DOWN)
+    assert solution.reached and solution.clear, solution.to_dict()
+    assert solution.tilt_deg < 20.0, solution.to_dict()
+
+
+def test_orientation_selection_costs_almost_no_position(arm_env):
+    """It picks among position-accurate solutions rather than trading against
+    position, which is what the rejected in-solve approaches did."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import (
+        DOWN, ORIENTATION_RESTARTS, solve_posture)
+
+    target = _object_position(env) + np.array([0.0, 0.0, 0.085])
+    selected = solve_posture(arm, target, restarts=ORIENTATION_RESTARTS, approach=DOWN)
+    assert selected.residual_m < 0.005, selected.to_dict()
+
+
+def test_a_tilt_is_always_reported_even_when_not_selected_on(arm_env):
+    """Reporting 0.0 for "not requested" would read as a perfect top-down
+    posture, which is the opposite of the truth."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import solve_posture
+
+    solution = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.085]),
+                             restarts=10)
+    assert solution.tilt_deg > 0.0
+    assert "tilt_deg" in solution.to_dict()
+
+
+def test_the_orientation_restart_budget_is_wider_than_the_default(arm_env):
+    """Calibrated: 60 restarts settled for 34.4 degrees where 200 reached
+    13.6, so orientation needs a wider search than position alone."""
+    from examples.advanced.robocasa.study_ik import ORIENTATION_RESTARTS
+
+    assert ORIENTATION_RESTARTS >= 150

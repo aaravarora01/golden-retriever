@@ -79,6 +79,17 @@ DROOP_LIMIT = 1.5
 
 ARM_JOINTS = tuple(f"robot0_joint{index + 1}" for index in range(7))
 GRIP_SITE = "gripper0_right_grip_site"
+#: A top-down grasp wants the gripper's approach axis pointing here.
+DOWN = np.array([0.0, 0.0, -1.0])
+#: Weight on orientation when choosing between position-accurate solutions, in
+#: metres per radian. Calibrated: the solution manifold is wide enough that
+#: random restarts already contain near-vertical postures, so this only has to
+#: break the tie, not steer the solve.
+ORIENTATION_WEIGHT = 0.08
+#: Restarts to use when an approach direction is requested. The default budget
+#: is calibrated for position alone; orientation needs a wider search — 60
+#: restarts settled for 34.4 degrees off vertical where 200 reached 13.6.
+ORIENTATION_RESTARTS = 200
 
 
 def joint_position_controller_config(robot: str = "PandaOmron") -> dict:
@@ -184,6 +195,16 @@ class ArmModel:
     def clamp(self, joints):
         return np.clip(joints, self.limits[:, 0] + 1e-3, self.limits[:, 1] - 1e-3)
 
+    def approach_axis(self):
+        """The gripper's approach direction in world coordinates."""
+        return np.asarray(
+            self.env.sim.data._data.site_xmat[self.site]).reshape(3, 3)[:, 2]
+
+    def tilt_from(self, direction=DOWN) -> float:
+        """Angle between the approach axis and `direction`, in radians."""
+        cosine = float(np.dot(self.approach_axis(), np.asarray(direction, dtype=float)))
+        return float(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
 
 def damped_step(arm: ArmModel, target, *, damping: float = DEFAULT_DAMPING,
                 posture_bias: float = 0.0):
@@ -214,6 +235,7 @@ class PostureSolution:
     residual_m: float
     obstructions: int
     restarts: int
+    tilt_rad: float = 0.0
 
     @property
     def reached(self) -> bool:
@@ -223,13 +245,19 @@ class PostureSolution:
     def clear(self) -> bool:
         return self.obstructions == 0
 
+    @property
+    def tilt_deg(self) -> float:
+        """How far the gripper points from the requested approach direction."""
+        return float(np.degrees(self.tilt_rad))
+
     def to_dict(self) -> dict:
         return {"residual_m": round(self.residual_m, 5), "obstructions": self.obstructions,
-                "restarts": self.restarts, "reached": self.reached, "clear": self.clear}
+                "restarts": self.restarts, "reached": self.reached, "clear": self.clear,
+                "tilt_deg": round(self.tilt_deg, 2)}
 
 
 def solve_posture(arm: ArmModel, target, *, restarts: int = 30, iterations: int = 120,
-                  seed: int = 0) -> PostureSolution:
+                  seed: int = 0, approach=None) -> PostureSolution:
     """Find a joint configuration putting the hand at `target`.
 
     Random restarts matter: from the reset posture alone the solve converges
@@ -247,6 +275,30 @@ def solve_posture(arm: ArmModel, target, *, restarts: int = 30, iterations: int 
     A target *at* the object's centre is a different matter and will not solve —
     the grip site cannot occupy the counter surface the object rests on. Aim a
     centimetre or two above it and let the fingers close around it.
+
+    `approach` requests a gripper direction, `DOWN` for a top-down grasp. It is
+    a *selection* criterion rather than a second task in the solve, and that is
+    deliberate: with seven joints and a three-axis position target the solution
+    manifold is four-dimensional, and random restarts already contain postures
+    pointing almost straight down — 13.6 degrees at the approach height and
+    11.9 at grasp height, both with sub-millimetre position error and no
+    collisions. Across restarts the orientation spans 13 to 159 degrees, so
+    without this the solver simply returns whichever posture it landed on, which
+    measured 49 to 52 degrees off vertical.
+
+    Trying to steer orientation *inside* the solve was tried first and is worse:
+    stacking it as a weighted second task costs position (0.39 m against
+    0.0008 m), and so does projecting it into the nullspace of the position
+    task — the exact projector leaks nothing, but the clamped joint motion no
+    longer preserves position, and separating the step caps did not recover it.
+    Selection among restarts needs none of that machinery.
+
+    Note that clear solutions get scarcer closer to the object: 27 of 200 at the
+    approach height against 4 of 200 at grasp height, so a low target wants a
+    larger restart budget. The budget also bounds the orientation it can find —
+    60 restarts settled for 34.4 degrees where 200 reached 13.6 — so
+    `ORIENTATION_RESTARTS` is the figure to use when `approach` is requested,
+    rather than the default that suffices for position alone.
     """
     import mujoco
 
@@ -264,7 +316,8 @@ def solve_posture(arm: ArmModel, target, *, restarts: int = 30, iterations: int 
             data.qpos[address] = value
         mujoco.mj_forward(model, data)
 
-    best, best_joints, best_clash = float("inf"), saved.copy(), 0
+    want = None if approach is None else np.asarray(approach, dtype=float)
+    best, best_joints, best_clash, best_tilt = float("inf"), saved.copy(), 0, 0.0
     for restart in range(restarts):
         joints = saved.copy() if restart == 0 else random.uniform(
             arm.limits[:, 0], arm.limits[:, 1])
@@ -277,13 +330,18 @@ def solve_posture(arm: ArmModel, target, *, restarts: int = 30, iterations: int 
         apply(joints)
         residual = float(np.linalg.norm(target - arm.hand()))
         clash = len(arm.obstructions())
-        score = residual + 0.5 * clash
+        # Measured either way, so a solution always reports how the gripper is
+        # pointing; only the *scoring* is opt-in. Reporting 0.0 for "not
+        # requested" would read as a perfect top-down posture.
+        tilt = arm.tilt_from(DOWN if want is None else want)
+        score = residual + 0.5 * clash + (0.0 if want is None
+                                          else ORIENTATION_WEIGHT * tilt)
         if score < best:
-            best, best_joints, best_clash = score, joints.copy(), clash
+            best, best_joints, best_clash, best_tilt = score, joints.copy(), clash, tilt
     apply(saved)
     return PostureSolution(joints=best_joints,
                            residual_m=float(np.linalg.norm(target - _hand_at(arm, best_joints))),
-                           obstructions=best_clash, restarts=restarts)
+                           obstructions=best_clash, restarts=restarts, tilt_rad=best_tilt)
 
 
 def _hand_at(arm: ArmModel, joints):
