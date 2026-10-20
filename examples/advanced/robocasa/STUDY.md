@@ -11,7 +11,7 @@ pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
 pixi run -e robocasa study-pnp-vague       # the task-specification axis
 pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
-pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 43 tests
+pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 54 tests
 ```
 
 ## What this is not
@@ -274,17 +274,44 @@ The restart budget bounds what orientation is findable: 60 restarts settled for
 default that suffices for position alone. Clear solutions also thin out near the
 object — 27 of 200 at the approach height against 4 of 200 at grasp height.
 
-**What is left is the grasp itself, and the chaining.** A second solve-and-follow descends
-to about 3 cm of the object and the fingers do not close on it. The remaining obstacle is that *chaining* stages is not yet reliable. A single
-solve-plan-follow is: the committed test reaches a planned point to under a
-centimetre, repeatably. Three in sequence are not — the same pipeline produced a
-0.0012 m final distance on one invocation and 0.4865 m on the next, because each
-stage starts from wherever the previous one left the arm, which changes both the
-IK seed and the tree the planner grows. `FollowReport.stalled` is the signal; a
-stalled stage needs retrying or re-planning rather than handing a bad posture
-onward. Follow parameters are also less forgiving than they look — tightening
-`tolerance` from 0.05 to 0.04 made a stage stall against its tick budget instead
-of tracking more accurately — so the committed defaults are the measured ones.
+**The pick works.** Approach, descend, close, lift: the object leaves the counter
+by 14.5 cm and is still held at the top, three runs out of three,
+deterministically. That is **reached, grasped and lifted — three of the four
+progress rungs, a Score of 75**, where every arm previously scored zero. The
+task's own `success` predicate is still false because it is pick-and-*place*
+into the cabinet and nothing transports or releases yet.
+
+Three things stood between the reach and the pick, and the first was a bug in
+this lane's own planner. **Bidirectional path reconstruction depended on which
+tree grew last**: tree 0 is rooted at the start and tree 1 at the goal, and the
+assembly reasoned about which had just grown instead of naming the connecting
+node on each side, so on odd iterations it returned a path that did not end at
+the goal. `follow_path` then reported a joint error of 0.00074 against whatever
+endpoint it was handed while the arm sat 3 radians from the solved posture and
+the gripper 0.9 m from the target. That is what made the pipeline vary run to
+run — the parity of the connecting step — and `plan_path` now asserts its
+endpoints, because a path that does not run start-to-goal is worse than no path.
+
+**Stages were not validated.** `reach` solves, plans and follows to one
+Cartesian target and checks the *gripper's* position rather than joint error,
+because a stage can land its joints while the hand is elsewhere, which is how
+the silent failure propagated into the next stage. A retry re-solves and
+re-plans from the arm's real posture with a fresh seed. Both stages now arrive
+first attempt.
+
+**And the grasp height was above the object.** The sugar cube's geoms are
+0.002–0.014 m in half-extent, so 2.5 cm above its centre closed the fingers just
+over the top — nudging it 5 mm without gripping. The working band measured 0.6
+to 1.2 cm; 1.8 cm only brushes it and 0 cm has no clear solution.
+
+**What is left is transport and release**, and the harness integration: the
+study's RoboCasa backend exposes `eef_delta`, while this pipeline drives joint
+targets, so a `joint_position` representation is needed before a scripted
+reference can run through the sweep and put a non-zero Score in the results
+table. A second solve-and-follow descends
+to about 3 cm of the object and the fingers do not close on it. Follow parameters are less forgiving than they look: tightening `tolerance` from
+0.05 to 0.04 made a stage stall against its tick budget instead of tracking more
+accurately, so the committed defaults are the measured ones.
 
 The superseded diagnosis follows, kept because it was the working hypothesis for
 several of the measurements above. With the planned path followed waypoint by waypoint,
