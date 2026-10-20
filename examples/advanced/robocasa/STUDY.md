@@ -11,7 +11,7 @@ pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
 pixi run -e robocasa study-pnp-vague       # the task-specification axis
 pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
-pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 25 tests
+pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 35 tests
 ```
 
 ## What this is not
@@ -220,8 +220,45 @@ cramped space: 54% of sampled joint space is collision-free, and 95% of a small
 neighbourhood around the start posture is. The planner is bidirectional because
 the free space at the goal is much tighter, 35% against 95%.
 
-**The remaining obstacle is trajectory tracking, and it is the third diagnosis
-this question has had.** With the planned path followed waypoint by waypoint,
+**Trajectory tracking is now solved, and the reach is.** `follow_path` commands
+densely along each planned segment and advances the commanded point only as the
+arm keeps up. With it the gripper reaches a point 9 cm above the object to
+within **0.7 mm with no new contact**, from 0.512 m at reset.
+
+Isolating that corrected two claims an earlier version of this file made.
+Gravity compensation was **already on** — robosuite's joint controller computes
+`mass_matrix @ (kp·e + kd·ė) + qfrc_bias` and tracks a clear 1.0 rad single-joint
+move to 0.0008 rad — so there was no droop to fix. And `output_max` does **not**
+clip an absolute target: it scales the delta path only, and `env.step` does not
+clip to `action_spec` either, so a commanded 2.5 rad arrives as 2.5 even though
+the spec advertises ±1. What looked like a drooping controller was a *blocked*
+joint: commanding the shoulder +1.0 rad drives the arm into contact and the
+torque then saturates against the actuator limit while the joint does not
+arrive.
+
+The real fault was subtler. The planner verifies the straight line between
+waypoints, but *commanding* a waypoint lets the arm find its own dynamic route
+there, which is not the line that was checked. Ramping relative to the achieved
+pose stalls, because the commanded point never gets ahead of a lagging arm; a
+fixed time schedule runs away from it, leaving the arm up to 0.8 rad behind and
+colliding with things the kinematic check called clear. Gating the advance on
+the arm keeping up is what makes the executed motion follow the verified path.
+
+**What is left is the grasp, not the reach.** A second solve-and-follow descends
+to about 3 cm of the object and the fingers do not close on it. The likely cause
+is orientation, which nothing in the solver constrains — `solve_posture` uses the
+position Jacobian only, so a solved posture is free to rotate the gripper away
+from the top-down approach the reset posture starts in, where the grip site's z
+axis points within 8 degrees of straight down. A first combined
+position-and-orientation solve made it worse rather than better: weighting the
+rotational error at 0.6 against position in one damped solve left a 0.41 m
+position error against 0.0008 m position-only, and did not achieve the
+orientation either. That solve is ill-conditioned; a two-stage approach — solve
+position, then rotate within the nullspace of the position task — is the next
+thing to try, and is recorded rather than guessed at a second time.
+
+The superseded diagnosis follows, kept because it was the working hypothesis for
+several of the measurements above. With the planned path followed waypoint by waypoint,
 the gripper reaches z = 1.022 against a 1.024 target — the height was never
 right before — and the final descent closes to 0.089 m, against 0.512 m at reset
 and the 0.288 m where RoboCasa's own controller stalls. But it does not grasp.

@@ -22,21 +22,38 @@ physical blocking. Closing that needs a motion planner that checks collisions
 along the path, which MuJoCo can support and this module deliberately does not
 attempt.
 
-So this is the foundation a working reference policy needs rather than the
-policy itself, and it is committed for three reasons: the solver is correct and
-a planner would call it, the measurements it produced retire two wrong theories,
-and the joint-control findings below are not discoverable from the documentation.
+**And the execution gap is closed.** `follow_path` commands densely along each
+planned segment, advancing the commanded point only as the arm keeps up. With
+it the gripper reaches a point 9 cm above the object to within **0.7 mm with
+zero collisions**, from 0.512 m at reset and against the 0.288 m where
+RoboCasa's own controller stalls.
+
+Why that was the fix, and why the obvious alternatives were not: the planner
+verifies the straight line between waypoints, but *commanding* a waypoint lets
+the arm take its own dynamic route there, which is not the line that was
+checked. Ramping relative to the achieved pose stalls, because the commanded
+point never gets ahead of a lagging arm. A fixed time schedule overruns it, so
+the arm falls up to 0.8 rad behind and collides. Gating the advance on the arm
+keeping up is what makes the executed motion follow the verified path.
+
+What remains is the grasp itself, not the reach. See the end of this module.
 
 Three facts about commanding this arm, each found by measurement:
 
 * The arm takes **absolute joint targets** only if the body-part controller is
   reconfigured to `JOINT_POSITION`; the default is `OSC_POSE`. Doing so widens
   the action vector to 13.
-* `output_max` **clips the absolute target**, so it must span the joint ranges
-  rather than the default narrow band.
-* The controller **droops under gravitational load**. A small move from
-  equilibrium tracks exactly; a large one leaves the shoulder and elbow short,
-  which integral correction fixes where the path is clear.
+* `output_max` does **not** clip an absolute target. It scales the *delta*
+  path only: with `input_type: absolute` the controller takes `goal_qpos =
+  action` verbatim, and `env.step` does not clip to `action_spec` either — a
+  commanded 2.5 rad arrives as 2.5 even though the spec advertises ±1. An
+  earlier version of this note claimed otherwise.
+* The controller **already compensates gravity** — `use_torque_compensation`
+  defaults on and the torque is `mass_matrix @ (kp·e + kd·ė) + qfrc_bias`. It
+  tracks a 1.0 rad single-joint move to 0.0008 rad when the path is clear. What
+  looked like droop was a *blocked* joint: commanding the shoulder +1.0 rad
+  drives the arm into contact, and the torque then saturates against the
+  actuator limit while the joint does not arrive.
 """
 
 from __future__ import annotations
@@ -481,3 +498,107 @@ def _shortcut(cache: _CollisionCache, waypoints, random, rounds: int = 120):
         if cache.segment_clear(points[first], points[second], checks=8):
             points = points[:first + 1] + points[second:]
     return points
+
+
+# --- following a planned path --------------------------------------------
+#
+# The piece that makes a verified path actually get executed. The planner checks
+# the straight line between two waypoints; commanding the second waypoint does
+# not make the arm travel that line, it makes the arm find its own way there
+# under its own dynamics, which is how a checked path still ends in a collision.
+#
+# Three approaches were measured. Commanding each waypoint directly leaves later
+# ones 1.8-2.1 rad short and collides. Ramping relative to the arm's achieved
+# pose never gets ahead of a lagging arm and stalls 0.5 rad out. A fixed time
+# schedule runs away from the arm, which falls up to 0.8 rad behind and hits
+# things the kinematic check called clear. Advancing the commanded point only
+# once the arm is within tolerance of it keeps the error small enough that the
+# executed motion follows the verified line.
+
+#: How far the commanded point advances per tick, in radians.
+FOLLOW_INCREMENT = 0.02
+#: How far behind the commanded point the arm may fall before it stops
+#: advancing. Larger is faster and tracks the planned line less closely.
+FOLLOW_TOLERANCE = 0.05
+#: Ticks spent settling onto each waypoint before moving to the next.
+FOLLOW_SETTLE = 80
+
+
+@dataclass
+class FollowReport:
+    """What executing a path actually did, as opposed to what was planned."""
+
+    ticks: int = 0
+    worst_obstructions: int = 0
+    joint_error: float = 0.0
+    stalled: bool = False
+
+    def to_dict(self) -> dict:
+        return {"ticks": self.ticks, "worst_obstructions": self.worst_obstructions,
+                "joint_error": round(self.joint_error, 5), "stalled": self.stalled,
+                "clean": self.worst_obstructions == 0 and not self.stalled}
+
+
+def follow_path(arm: ArmModel, waypoints, *, command, increment: float = FOLLOW_INCREMENT,
+                tolerance: float = FOLLOW_TOLERANCE, settle: int = FOLLOW_SETTLE,
+                budget: int = 1200) -> FollowReport:
+    """Drive the arm along `waypoints`, keeping the command near the arm.
+
+    `command` is called with a joint target each tick and is expected to step
+    the simulation — the caller owns the gripper and any other action segments,
+    so this function never constructs an action vector itself.
+
+    `worst_obstructions` is the honest measure of whether the verified path was
+    actually followed: a non-zero value means the executed motion left the line
+    the planner checked, whatever the final error says.
+    """
+    if type(increment) is not float or not 0.0 < increment <= 0.5:
+        raise ValueError("increment must be a float in (0, 0.5]")
+    if type(tolerance) is not float or not 0.0 < tolerance <= 1.0:
+        raise ValueError("tolerance must be a float in (0, 1]")
+    points = [np.asarray(point, dtype=float) for point in waypoints]
+    if len(points) < 2:
+        raise ValueError("following needs at least a start and a target")
+    report = FollowReport()
+    for target in points[1:]:
+        start = arm.joints().copy()
+        span = float(np.linalg.norm(target - start))
+        if span < 1e-9:
+            continue
+        direction = (target - start) / span
+        travelled, used = 0.0, 0
+        while travelled < span and used < budget:
+            if float(np.linalg.norm(arm.joints() - (start + direction * travelled))) < tolerance:
+                travelled = min(span, travelled + increment)
+            command(arm.clamp(start + direction * travelled))
+            used += 1
+            report.ticks += 1
+            report.worst_obstructions = max(report.worst_obstructions,
+                                            len(arm.obstructions()))
+        if used >= budget:
+            report.stalled = True
+        for _ in range(settle):
+            command(arm.clamp(target))
+            report.ticks += 1
+    report.joint_error = float(np.linalg.norm(arm.joints() - points[-1]))
+    return report
+
+
+# --- what is still open --------------------------------------------------
+#
+# Reaching is solved; grasping is not. With a planned, followed approach the
+# gripper sits 0.7 mm above the object, and a second solve-and-follow descends
+# to within about 3 cm of it, but the fingers do not close on the object.
+#
+# The likely cause is orientation, which nothing above constrains: `solve_posture`
+# uses the position Jacobian only, so a solved posture is free to rotate the
+# gripper away from the top-down approach the reset posture starts in — the grip
+# site's z axis points within 8 degrees of straight down at reset.
+#
+# A first attempt at a combined position-and-orientation solve made things worse
+# rather than better: weighting the rotational error at 0.6 against position in
+# one damped solve left a 0.41 m position error, against 0.0008 m for the
+# position-only solve, and did not achieve the orientation either. The solve is
+# ill-conditioned that way. A two-stage approach — solve position, then rotate
+# within the nullspace of the position task — is the next thing to try, and is
+# recorded here rather than guessed at again.

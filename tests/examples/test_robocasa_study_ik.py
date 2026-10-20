@@ -297,3 +297,104 @@ def test_an_unusable_planner_budget_is_rejected(arm_env, bad):
 
     with pytest.raises(ValueError):
         plan_path(arm, arm.joints(), **bad)
+
+
+# --- following a planned path --------------------------------------------
+
+
+def _commander(env, arm, grip=-1.0):
+    """Step the simulation with a joint target, leaving other segments alone."""
+    def command(target):
+        action = np.zeros(env.action_dim, dtype=np.float32)
+        action[0:7] = arm.clamp(target)
+        action[7] = grip
+        action[-1] = -1.0
+        env.step(action)
+    return command
+
+
+def test_following_a_planned_path_reaches_the_goal_without_collisions(arm_env):
+    """The result this module exists for. Commanding waypoints directly leaves
+    the later ones 1.8-2.1 rad short and collides; gating the commanded point
+    on the arm keeping up follows the line the planner verified."""
+    env, arm = arm_env
+    env.reset()
+    arm = type(arm)(env=env)
+    from examples.advanced.robocasa.study_ik import follow_path, plan_path, solve_posture
+
+    target = _object_position(env) + np.array([0.0, 0.0, 0.09])
+    goal = solve_posture(arm, target)
+    assert goal.clear
+    path = plan_path(arm, goal.joints, seed=0)
+    assert path.found
+    # The reset posture self-collides, so the bar is that execution introduces
+    # no *new* contact, not that there is none.
+    at_start = len(arm.obstructions())
+    report = follow_path(arm, path.waypoints, command=_commander(env, arm))
+    assert report.worst_obstructions <= at_start, report.to_dict()
+    assert not report.stalled, report.to_dict()
+    assert report.joint_error < 0.05, report.to_dict()
+    # The payoff: the gripper is at the planned point, from 0.512 m at reset.
+    assert float(np.linalg.norm(target - arm.hand())) < 0.01
+
+
+def test_a_report_says_whether_the_verified_path_was_actually_followed(arm_env):
+    """`worst_obstructions` is the honest measure: a non-zero value means the
+    executed motion left the checked line, whatever the final error says."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import FollowReport
+
+    assert FollowReport(worst_obstructions=0, stalled=False).to_dict()["clean"] is True
+    assert FollowReport(worst_obstructions=2, stalled=False).to_dict()["clean"] is False
+    assert FollowReport(worst_obstructions=0, stalled=True).to_dict()["clean"] is False
+
+
+def test_following_needs_at_least_a_start_and_a_target(arm_env):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import follow_path
+
+    with pytest.raises(ValueError, match="start and a target"):
+        follow_path(arm, [arm.joints()], command=_commander(env, arm))
+
+
+@pytest.mark.parametrize("bad", ({"increment": 0.0}, {"increment": 1.0},
+                                  {"tolerance": 0.0}, {"tolerance": 2.0},
+                                  {"increment": 1}))
+def test_an_unusable_follow_setting_is_rejected(arm_env, bad):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import follow_path
+
+    with pytest.raises(ValueError):
+        follow_path(arm, [arm.joints(), arm.joints() + 0.1],
+                    command=_commander(env, arm), **bad)
+
+
+def test_the_controller_tracks_a_large_clear_joint_move(arm_env):
+    """Pins the corrected finding: this is not a drooping controller. A 1.0 rad
+    move on a joint whose path is clear arrives, because gravity compensation is
+    already on. What fails is a move that drives the arm into contact."""
+    env, arm = arm_env
+    env.reset()
+    arm = type(arm)(env=env)
+    command = _commander(env, arm)
+    start = arm.joints().copy()
+    target = start.copy()
+    target[3] = np.clip(start[3] + 1.0, arm.limits[3, 0] + 0.05, arm.limits[3, 1] - 0.05)
+    for _ in range(400):
+        command(target)
+    assert abs(float(arm.joints()[3] - target[3])) < 0.02
+
+
+def test_an_absolute_joint_command_is_not_clipped_by_the_action_spec(arm_env):
+    """Corrects an earlier claim in this module: the spec advertises +/-1 and
+    the controller still receives the value verbatim."""
+    env, arm = arm_env
+    env.reset()
+    arm = type(arm)(env=env)
+    low, high = env.action_spec
+    assert high[0] <= 1.0 + 1e-9, "the spec does advertise a narrow range"
+    controller = env.robots[0].composite_controller.part_controllers["right"]
+    target = arm.joints().copy()
+    target[0] = 2.5
+    _commander(env, arm)(target)
+    assert float(controller.goal_qpos[0]) == pytest.approx(2.5, abs=1e-6)
