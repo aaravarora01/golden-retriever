@@ -896,3 +896,333 @@ def test_the_two_latencies_are_separate_fields():
     as model latency would understate it by orders of magnitude."""
     row = _record(latency_s=0.001, recorded_latency_s=2.4).to_dict()
     assert row["latency_s"] != row["recorded_latency_s"]
+
+
+# --- the model boundary and the three policy forms ----------------------
+
+
+def _config(**overrides):
+    from examples.advanced.robocasa.study_model import ModelConfig
+
+    return ModelConfig(**{"model_id": "test:model", **overrides})
+
+
+def _answers(*texts):
+    from examples.advanced.robocasa.study_model import OfflineModelClient
+
+    return OfflineModelClient(answers=list(texts))
+
+
+def _direct(client, **kwargs):
+    from examples.advanced.robocasa.study_model import DirectModelMethod
+
+    return DirectModelMethod(client=client, config=kwargs.pop("config", _config()),
+                             dof=7, **kwargs)
+
+
+@pytest.mark.parametrize("field,value", (
+    ("model_id", ""), ("model_id", "  "), ("model_id", 7),
+    ("prompt_variant", "nope"), ("reasoning_effort", "maximum"),
+    ("horizon_band", "medium"),
+    ("temperature", -0.1), ("temperature", 2.1), ("temperature", 0),
+    ("timeout_seconds", 0.0), ("timeout_seconds", 60),
+    ("max_response_bytes", 0), ("max_output_tokens", -1),
+))
+def test_an_unusable_model_config_is_rejected(field, value):
+    with pytest.raises(ValueError):
+        _config(**{field: value})
+
+
+def test_the_horizon_bands_are_the_studys():
+    from examples.advanced.robocasa.study_model import HORIZON_BANDS
+
+    assert HORIZON_BANDS == {"short": (3, 15), "long": (16, 32)}
+    assert _config(horizon_band="long").horizon_range == (16, 32)
+
+
+def test_the_token_cap_is_the_studys():
+    assert _config().max_output_tokens == 8_192
+
+
+@pytest.mark.parametrize("variant", ("terse", "explained", "with_format"))
+def test_every_prompt_variant_renders_with_the_action_width(variant):
+    text = _config(prompt_variant=variant).instructions(dof=7)
+    assert text.strip() and "{" not in text
+
+
+@pytest.mark.parametrize("field,value", (
+    ("prompt_variant", "terse"), ("model_id", "other:model"),
+    ("reasoning_effort", "high"), ("horizon_band", "long"),
+))
+def test_each_prompt_axis_changes_the_digest(field, value):
+    """Wired: the configuration is part of the hashed prompt, so two
+    configurations cannot collide on one transcript entry."""
+    from dataclasses import replace
+
+    from examples.advanced.robocasa.study_model import assemble_model_prompt
+    from examples.advanced.robocasa.study_transcript import prompt_digest
+
+    observation = _observation()
+    base = prompt_digest(assemble_model_prompt(observation, _config(), dof=7))
+    altered = prompt_digest(assemble_model_prompt(
+        observation, replace(_config(), **{field: value}), dof=7))
+    assert base != altered
+
+
+def test_carried_history_changes_the_digest():
+    """Which is what makes Direct and Agentic distinguishable requests rather
+    than the same call under two names."""
+    from examples.advanced.robocasa.study_model import assemble_model_prompt
+    from examples.advanced.robocasa.study_transcript import prompt_digest
+
+    observation = _observation()
+    without = prompt_digest(assemble_model_prompt(observation, _config(), dof=7))
+    with_history = prompt_digest(assemble_model_prompt(
+        observation, _config(), dof=7, history=({"call": 0, "horizon": 5},)))
+    assert without != with_history
+
+
+# --- every expected failure becomes a refusal ---------------------------
+
+
+@pytest.mark.parametrize("status", ("timeout", "oversize", "refused", "transport_error"))
+def test_a_non_ok_status_is_a_refusal(status):
+    from examples.advanced.robocasa.study_model import ModelCallStatus, ModelResponse
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput
+
+    method = _direct(_answers(ModelResponse(status=ModelCallStatus(status), detail="why")))
+    with pytest.raises(InvalidPolicyOutput, match=f"ended {status}"):
+        method.predict(_observation())
+    assert method.telemetry()[0]["parse_ok"] is False
+
+
+def test_an_unparseable_answer_is_a_refusal():
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput
+
+    with pytest.raises(InvalidPolicyOutput):
+        _direct(_answers("I would rather not.")).predict(_observation())
+
+
+def test_a_chunk_outside_the_configured_band_is_a_refusal():
+    """The horizon band is part of the configuration, so a model that ignores
+    it has produced an answer the run did not ask for."""
+    import json
+
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput
+
+    one_row = json.dumps([[0.0] * 7])
+    with pytest.raises(InvalidPolicyOutput, match="outside the configured short band"):
+        _direct(_answers(one_row)).predict(_observation())
+
+
+def test_a_client_that_raises_is_a_refusal_naming_the_transport():
+    from examples.advanced.robocasa.study_model import OfflineModelClient
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput
+
+    class _Exploding(OfflineModelClient):
+        def complete(self, prompt, config):
+            raise ConnectionResetError("peer hung up")
+
+    with pytest.raises(InvalidPolicyOutput, match="transport_error"):
+        _direct(_Exploding()).predict(_observation())
+
+
+def test_an_oversize_answer_is_a_refusal():
+    import json
+
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput
+
+    rows = json.dumps([[0.0] * 7] * 5)
+    method = _direct(_answers(rows), config=_config(max_response_bytes=10))
+    with pytest.raises(InvalidPolicyOutput, match="exceeds its configured bound"):
+        method.predict(_observation())
+
+
+def test_the_base_protocol_refuses_to_be_used_directly():
+    from examples.advanced.robocasa.study_model import ModelClient
+
+    with pytest.raises(NotImplementedError):
+        ModelClient().complete("x", _config())
+
+
+def test_a_non_client_reference_is_rejected():
+    from examples.advanced.robocasa.study_model import load_model_client
+
+    with pytest.raises(TypeError, match="complete"):
+        load_model_client("examples.advanced.robocasa.study_model:PROMPT_VARIANTS")
+    with pytest.raises(ValueError, match="module:symbol"):
+        load_model_client("examples.advanced.robocasa.study_model.OfflineModelClient")
+
+
+# --- the three forms ----------------------------------------------------
+
+
+def test_all_three_forms_produce_a_chunk_with_no_key():
+    from examples.advanced.robocasa.study_model import offline_forms
+
+    forms = offline_forms(lambda: StillMethod(horizon=5))
+    assert set(forms) == {"direct", "agentic", "orchestrated"}
+    for method in forms.values():
+        chunk = method.predict(_observation())
+        assert chunk.horizon == 5 and chunk.dof == 7
+
+
+def test_the_three_forms_agree_against_the_offline_client():
+    """They answer from the same wrapped method, so a difference would mean the
+    harness alters behaviour rather than the form being measured."""
+    from examples.advanced.robocasa.study_model import offline_forms
+
+    forms = offline_forms(lambda: StillMethod(horizon=5))
+    chunks = [method.predict(_observation()).actions for method in forms.values()]
+    assert all(np.allclose(chunks[0], other) for other in chunks[1:])
+
+
+def test_the_agentic_form_carries_history_across_calls():
+    from examples.advanced.robocasa.study_model import AgenticModelMethod, OfflineModelClient
+
+    method = AgenticModelMethod(
+        client=OfflineModelClient(method=StillMethod(horizon=5)), config=_config(),
+        dof=7, memory=2)
+    for _ in range(3):
+        method.predict(_observation())
+    # Three calls, and the prompts differ because the carried window grew.
+    prompts = method.client.calls
+    assert len(prompts) == 3 and len(set(prompts)) == 3
+
+
+def test_the_agentic_form_at_zero_memory_matches_direct():
+    """Informationally identical by construction, so a reported difference
+    between them at memory 0 would be noise."""
+    from examples.advanced.robocasa.study_model import (
+        AgenticModelMethod, DirectModelMethod, OfflineModelClient)
+
+    direct = DirectModelMethod(
+        client=OfflineModelClient(method=StillMethod(horizon=5)), config=_config(), dof=7)
+    agentic = AgenticModelMethod(
+        client=OfflineModelClient(method=StillMethod(horizon=5)), config=_config(),
+        dof=7, memory=0)
+    direct.predict(_observation())
+    agentic.predict(_observation())
+    assert direct.client.calls == agentic.client.calls
+
+
+@pytest.mark.parametrize("memory", (-1, 17, 1.0, None))
+def test_an_unusable_memory_depth_is_rejected(memory):
+    from examples.advanced.robocasa.study_model import AgenticModelMethod, OfflineModelClient
+
+    with pytest.raises(ValueError):
+        AgenticModelMethod(client=OfflineModelClient(), config=_config(), memory=memory)
+
+
+def test_the_orchestrated_form_records_every_review():
+    """The intervention rate has to be readable without re-running anything."""
+    from examples.advanced.robocasa.study_model import offline_forms
+
+    method = offline_forms(lambda: StillMethod(horizon=5))["orchestrated"]
+    method.predict(_observation())
+    review, = method.reviews
+    assert review["proposed_steps"] == 5 and review["committed_steps"] == 5
+    assert review["intervened"] is False
+
+
+def test_the_orchestrated_form_falls_back_to_the_proposal_on_a_refusal():
+    """A reviewer that cannot answer must not fail the episode: the base
+    policy's proposal already exists and is what it was reviewing."""
+    from examples.advanced.robocasa.study_model import OfflineModelClient, OrchestratedModelMethod
+
+    method = OrchestratedModelMethod(
+        client=OfflineModelClient(answers=["nonsense"]), config=_config(), dof=7,
+        base=StillMethod(horizon=5))
+    chunk = method.predict(_observation())
+    assert chunk.horizon == 5
+    review, = method.reviews
+    assert review["intervened"] is False and review["reason"]
+
+
+def test_the_orchestrated_form_records_an_intervention():
+    import json
+
+    from examples.advanced.robocasa.study_model import OfflineModelClient, OrchestratedModelMethod
+
+    shorter = json.dumps([[0.0] * 7] * 3)
+    method = OrchestratedModelMethod(
+        client=OfflineModelClient(answers=[shorter]), config=_config(), dof=7,
+        base=StillMethod(horizon=8))
+    chunk = method.predict(_observation())
+    assert chunk.horizon == 3
+    review, = method.reviews
+    assert review["proposed_steps"] == 8 and review["committed_steps"] == 3
+    assert review["intervened"] is True
+
+
+def test_the_orchestrated_proposal_length_is_the_studys():
+    from examples.advanced.robocasa.study_model import ORCHESTRATED_PROPOSAL_STEPS
+
+    assert ORCHESTRATED_PROPOSAL_STEPS == 15
+
+
+def test_an_orchestrated_method_needs_a_base():
+    from examples.advanced.robocasa.study_model import OfflineModelClient, OrchestratedModelMethod
+
+    with pytest.raises(TypeError, match="base with predict"):
+        OrchestratedModelMethod(client=OfflineModelClient(), config=_config())
+
+
+# --- the ledger -----------------------------------------------------------
+
+
+def test_the_model_ledger_names_the_configuration_and_nothing_measured():
+    from examples.advanced.robocasa.study_model import OfflineModelClient
+    from examples.advanced.robocasa.study_telemetry import NONDETERMINISTIC_FIELDS
+
+    method = _direct(OfflineModelClient(method=StillMethod(horizon=5)))
+    method.predict(_observation())
+    entry, = method.canonical_ledger()
+    assert entry["model_config"] == _config().to_dict()
+    assert all(field not in entry for field in NONDETERMINISTIC_FIELDS)
+    assert "latency_s" in method.telemetry()[0]
+
+
+def test_a_call_can_be_banked_for_free_replay():
+    """So one paid sweep replays offline afterwards."""
+    from examples.advanced.robocasa.study_model import OfflineModelClient
+    from examples.advanced.robocasa.study_transcript import TranscriptStore
+
+    store = TranscriptStore({})
+    method = _direct(OfflineModelClient(method=StillMethod(horizon=5)), record_into=store)
+    method.predict(_observation())
+    assert len(store) == 1
+
+
+def test_a_refused_call_is_not_banked():
+    """A transcript of answers that do not parse would replay as refusals and
+    read as a model failure rather than a recording failure."""
+    from examples.advanced.robocasa.study_transcript import InvalidPolicyOutput, TranscriptStore
+
+    store = TranscriptStore({})
+    method = _direct(_answers("nonsense"), record_into=store)
+    with pytest.raises(InvalidPolicyOutput):
+        method.predict(_observation())
+    assert len(store) == 0
+
+
+def test_the_prompt_axes_are_wired_but_not_live():
+    """Asserting both halves so neither can be read as a finding: the digest
+    changes with the configuration, and the offline client's answer does not."""
+    from dataclasses import replace
+
+    from examples.advanced.robocasa.study_model import (
+        PROMPT_VARIANTS, OfflineModelClient, assemble_model_prompt)
+    from examples.advanced.robocasa.study_transcript import prompt_digest
+
+    observation = _observation()
+    configs = [replace(_config(), prompt_variant=name) for name in sorted(PROMPT_VARIANTS)]
+    digests = {prompt_digest(assemble_model_prompt(observation, config, dof=7))
+               for config in configs}
+    assert len(digests) == len(configs), "the axis does not reach the model boundary"
+
+    answers = set()
+    for config in configs:
+        method = _direct(OfflineModelClient(method=StillMethod(horizon=5)), config=config)
+        answers.add(method.predict(observation).actions.tobytes())
+    assert len(answers) == 1, "the offline client is supposed to ignore the configuration"
