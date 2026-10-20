@@ -186,3 +186,114 @@ def test_the_droop_compensator_is_inert_when_tracking_is_exact():
         command = compensator.command(want, want)
     assert np.allclose(command, want)
     assert not compensator.wound_up
+
+
+# --- motion planning -----------------------------------------------------
+
+
+def test_the_direct_path_to_the_goal_is_blocked(arm_env):
+    """The premise the planner exists for: both endpoints are clear and the
+    straight line between them is not."""
+    import mujoco
+
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import solve_posture
+
+    model, data = env.sim.model._model, env.sim.data._data
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.09]))
+    saved = arm.joints().copy()
+
+    def clashes(joints):
+        for address, value in zip(arm.qadr, joints):
+            data.qpos[address] = value
+        mujoco.mj_forward(model, data)
+        return len(arm.obstructions())
+
+    try:
+        assert clashes(goal.joints) == 0, "the goal posture should be clear"
+        worst = max(clashes(saved + (goal.joints - saved) * (i / 20)) for i in range(21))
+        assert worst > 0, "if the straight line were clear, no planner would be needed"
+    finally:
+        clashes(saved)
+
+
+def test_the_planner_finds_a_collision_free_path(arm_env):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path, solve_posture
+
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.09]))
+    path = plan_path(arm, goal.joints, seed=0)
+    assert path.found, path.to_dict()
+    assert len(path.waypoints) >= 2
+    # Smoothing should collapse an RRT's wandering, because a wandering path
+    # costs control steps, which is one of the study's reported metrics.
+    assert path.smoothed_from > len(path.waypoints)
+
+
+def test_every_planned_segment_is_collision_free(arm_env):
+    """The property that makes the path worth having, checked independently of
+    the planner's own bookkeeping."""
+    import mujoco
+
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path, solve_posture
+
+    model, data = env.sim.model._model, env.sim.data._data
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.09]))
+    path = plan_path(arm, goal.joints, seed=0)
+    saved = arm.joints().copy()
+
+    def clashes(joints):
+        for address, value in zip(arm.qadr, joints):
+            data.qpos[address] = value
+        mujoco.mj_forward(model, data)
+        return len(arm.obstructions())
+
+    try:
+        # The start posture self-collides at reset, so the first waypoint is
+        # exempt; every segment after it must be clear.
+        for first, second in zip(path.waypoints[1:], path.waypoints[2:]):
+            for index in range(1, 9):
+                assert clashes(first + (second - first) * (index / 8)) == 0
+    finally:
+        clashes(saved)
+
+
+def test_planning_restores_the_simulation_state(arm_env):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path, solve_posture
+
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.09]))
+    before, hand_before = arm.joints().copy(), arm.hand().copy()
+    plan_path(arm, goal.joints, iterations=300)
+    assert np.allclose(arm.joints(), before, atol=1e-9)
+    assert np.allclose(arm.hand(), hand_before, atol=1e-9)
+
+
+def test_the_planner_reports_failure_rather_than_looping(arm_env):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path, solve_posture
+
+    goal = solve_posture(arm, _object_position(env) + np.array([0.0, 0.0, 0.09]))
+    path = plan_path(arm, goal.joints, iterations=2, seed=7)
+    assert path.found is False and path.waypoints == []
+
+
+def test_a_goal_in_collision_is_refused_before_planning(arm_env):
+    """Planning to an unreachable posture would burn the whole budget."""
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path
+
+    buried = arm.limits[:, 0] + 1e-3
+    path = plan_path(arm, buried, iterations=50)
+    assert path.found is False and path.iterations == 0
+
+
+@pytest.mark.parametrize("bad", ({"iterations": 0}, {"step": 0.0}, {"step": 2.0},
+                                  {"step": 1}))
+def test_an_unusable_planner_budget_is_rejected(arm_env, bad):
+    env, arm = arm_env
+    from examples.advanced.robocasa.study_ik import plan_path
+
+    with pytest.raises(ValueError):
+        plan_path(arm, arm.joints(), **bad)

@@ -11,7 +11,7 @@ pixi run -e robocasa study-pnp-baselines   # per-method summary
 pixi run -e robocasa study-pnp-sweep       # with every episode row
 pixi run -e robocasa study-pnp-vague       # the task-specification axis
 pixi run -e robocasa test-robocasa-study   # simulator-free, 188 tests
-pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 15 tests
+pixi run -e robocasa test-robocasa-study-ik # simulator-backed, 25 tests
 ```
 
 ## What this is not
@@ -48,7 +48,7 @@ the model-call count, so neither had to be invented.
 | `study_telemetry` | Latency, tokens and cost, beside the results not in them |
 | `study_transcript` | Record and replay calls keyed by prompt digest |
 | `study_model` | The model call boundary and the three policy forms |
-| `study_ik` | Damped-least-squares IK, posture solving, droop compensation |
+| `study_ik` | IK, posture solving, droop compensation, RRT-Connect planning |
 
 ## Axis coverage
 
@@ -210,9 +210,28 @@ rad short. That is physical blocking rather than control error: integral
 correction drives the other five joints to 0.002 rad and those two do not move,
 which is exactly what `DroopCompensator.wound_up` reports.
 
-Closing it needs a collision-checked planner in joint space — MuJoCo supplies
-the collision queries and `solve_posture` supplies the goal configurations, so
-the remaining work is the planner itself. Three facts about commanding this arm
+A collision-checked planner was then built. `plan_path` is bidirectional
+RRT-Connect in joint space, with every extension verified by interpolated
+collision checks, and it **works**: it finds a clear path in a few thousand
+iterations and smoothing collapses it from ~74 waypoints to 5. Single-waypoint
+routing had failed — 400 random intermediate postures produced no clear two-leg
+path — but that was straight-line segments clipping obstacles rather than a
+cramped space: 54% of sampled joint space is collision-free, and 95% of a small
+neighbourhood around the start posture is. The planner is bidirectional because
+the free space at the goal is much tighter, 35% against 95%.
+
+**The remaining obstacle is trajectory tracking, and it is the third diagnosis
+this question has had.** With the planned path followed waypoint by waypoint,
+the gripper reaches z = 1.022 against a 1.024 target — the height was never
+right before — and the final descent closes to 0.089 m, against 0.512 m at reset
+and the 0.288 m where RoboCasa's own controller stalls. But it does not grasp.
+The later waypoints of a planned path do not converge: the position controller
+leaves them 1.8 to 2.1 rad short even after 400 steps each, and the droop
+correction saturates, so the path's collision-avoidance is not actually being
+honoured. Driving an arm to arbitrary joint configurations under gravitational
+load needs either a controller with gravity compensation, or a time-parameterised
+trajectory rather than a sequence of setpoints. That is the next thing to try,
+and it is a controls problem rather than a planning or kinematics one. Three facts about commanding this arm
 are recorded in `study_ik` because none is in any documentation: the arm takes
 absolute joint targets only once the body-part controller is reconfigured to
 `JOINT_POSITION`, which widens the action vector to 13; `output_max` clips the

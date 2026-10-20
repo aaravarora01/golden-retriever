@@ -307,3 +307,177 @@ class DroopCompensator:
     def wound_up(self) -> bool:
         """Whether any correction has saturated, meaning a joint is blocked."""
         return self.bias is not None and bool(np.any(np.abs(self.bias) >= self.limit - 1e-9))
+
+
+# --- motion planning ------------------------------------------------------
+#
+# A collision-checked path is the piece the solver alone does not supply. The
+# start and goal postures are each collision-free while the straight line
+# between them is not, so commanding the goal directly leaves the shoulder and
+# elbow blocked against the cabinet.
+#
+# Single-waypoint routing is too weak: 400 random intermediate postures produced
+# no clear two-leg path, and the mid-range posture sits in 19 collisions because
+# it is inside the kitchen furniture. But the space is not cramped — 54% of
+# sampled joint space is collision-free, and 95% of a small neighbourhood around
+# the start posture is. The failure was straight-line *segments* clipping
+# obstacles, not a shortage of free space, which is exactly the case a tree-based
+# planner growing in small checked steps handles.
+
+#: Planner step, in radians. Small enough that a step cannot tunnel through a
+#: thin obstacle, large enough to cross the workspace in a tractable number.
+PLANNER_STEP = 0.15
+#: Collision checks interpolated within one step, so a step is verified rather
+#: than assumed.
+STEP_CHECKS = 4
+
+
+@dataclass
+class PlannedPath:
+    """A collision-checked joint-space path, and what finding it cost."""
+
+    waypoints: list = field(default_factory=list)
+    iterations: int = 0
+    found: bool = False
+    smoothed_from: int = 0
+
+    def to_dict(self) -> dict:
+        return {"found": self.found, "waypoints": len(self.waypoints),
+                "iterations": self.iterations, "smoothed_from": self.smoothed_from}
+
+
+class _CollisionCache:
+    """Posture collision queries against a restored simulation state.
+
+    Every query writes `qpos` and runs forward kinematics, so the caller's state
+    has to be put back — a planner that left the arm at its last sampled posture
+    would corrupt the episode it was planning for.
+    """
+
+    def __init__(self, arm: ArmModel):
+        import mujoco
+
+        self.arm = arm
+        self.mujoco = mujoco
+        self.model = arm.env.sim.model._model
+        self.data = arm.env.sim.data._data
+        self.saved = arm.joints().copy()
+        self.checks = 0
+
+    def clear(self, joints) -> bool:
+        self.checks += 1
+        for address, value in zip(self.arm.qadr, joints):
+            self.data.qpos[address] = value
+        self.mujoco.mj_forward(self.model, self.data)
+        return not self.arm.obstructions()
+
+    def segment_clear(self, start, end, checks: int = STEP_CHECKS) -> bool:
+        start, end = np.asarray(start), np.asarray(end)
+        for index in range(1, checks + 1):
+            if not self.clear(start + (end - start) * (index / checks)):
+                return False
+        return True
+
+    def restore(self) -> None:
+        for address, value in zip(self.arm.qadr, self.saved):
+            self.data.qpos[address] = value
+        self.mujoco.mj_forward(self.model, self.data)
+
+
+def plan_path(arm: ArmModel, goal, *, iterations: int = 4000, step: float = PLANNER_STEP,
+              seed: int = 0, smooth: bool = True) -> PlannedPath:
+    """Bidirectional RRT-Connect from the current posture to `goal`.
+
+    Two trees grown toward each other, each extension verified by interpolated
+    collision checks rather than assumed clear. Bidirectional because the free
+    space around the goal is markedly tighter than around the start — 35% of a
+    small neighbourhood versus 95% — so growing only forward would spend most of
+    its samples far from where the hard part is.
+
+    The simulation state is restored before returning, so this is a query.
+    """
+    if type(iterations) is not int or not 1 <= iterations <= 100_000:
+        raise ValueError("iterations must be an int from 1 through 100000")
+    if type(step) is not float or not 0.0 < step <= 1.0:
+        raise ValueError("step must be a float in (0, 1]")
+    goal = np.asarray(goal, dtype=float)
+    cache = _CollisionCache(arm)
+    try:
+        start = cache.saved.copy()
+        if not cache.clear(goal):
+            return PlannedPath(iterations=0, found=False)
+        # The reset posture self-collides, so the start is allowed to be in
+        # contact; the path out of it is what must be clear.
+        trees = ([start.copy()], [goal.copy()])
+        parents = ([-1], [-1])
+        random = np.random.default_rng(seed)
+        low, high = arm.limits[:, 0], arm.limits[:, 1]
+
+        def extend(tree, parent, toward):
+            distances = [float(np.linalg.norm(node - toward)) for node in tree]
+            nearest = int(np.argmin(distances))
+            direction = toward - tree[nearest]
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-9:
+                return nearest
+            candidate = np.clip(tree[nearest] + direction * (min(step, norm) / norm), low, high)
+            if not cache.segment_clear(tree[nearest], candidate):
+                return None
+            tree.append(candidate)
+            parent.append(nearest)
+            return len(tree) - 1
+
+        connection = None
+        for iteration in range(1, iterations + 1):
+            sample = random.uniform(low, high)
+            active = iteration % 2
+            grown = extend(trees[active], parents[active], sample)
+            if grown is None:
+                continue
+            other = 1 - active
+            reached = extend(trees[other], parents[other], trees[active][grown])
+            if reached is not None and cache.segment_clear(
+                    trees[other][reached], trees[active][grown]):
+                connection = (iteration, active, grown, other, reached)
+                break
+        if connection is None:
+            return PlannedPath(iterations=iterations, found=False)
+
+        iteration, active, grown, other, reached = connection
+
+        def chain(tree, parent, index):
+            path = []
+            while index != -1:
+                path.append(tree[index])
+                index = parent[index]
+            return path
+
+        forward = chain(trees[active], parents[active], grown)[::-1]
+        backward = chain(trees[other], parents[other], reached)
+        waypoints = forward + backward if active == 0 else (backward + forward[::-1])[::-1]
+        raw = len(waypoints)
+        if smooth:
+            waypoints = _shortcut(cache, waypoints, random)
+        return PlannedPath(waypoints=[np.asarray(point) for point in waypoints],
+                           iterations=iteration, found=True, smoothed_from=raw)
+    finally:
+        cache.restore()
+
+
+def _shortcut(cache: _CollisionCache, waypoints, random, rounds: int = 120):
+    """Replace detours with straight segments where they are collision-free.
+
+    An RRT path wanders, and a wandering path costs control steps — one of the
+    study's reported metrics — so leaving it unsmoothed would inflate a number
+    the harness exists to measure.
+    """
+    points = [np.asarray(point) for point in waypoints]
+    for _ in range(rounds):
+        if len(points) <= 2:
+            break
+        first, second = sorted(random.integers(0, len(points), 2))
+        if second - first < 2:
+            continue
+        if cache.segment_clear(points[first], points[second], checks=8):
+            points = points[:first + 1] + points[second:]
+    return points
