@@ -643,3 +643,256 @@ def test_an_unusable_task_entry_is_rejected(bad):
 
     with pytest.raises(ValueError):
         PnPTask(**bad)
+
+
+# --- telemetry and transcript replay ------------------------------------
+
+
+def _observation(fill=0, prompt="pick the cube", state=5):
+    return policy_observation(frames=[[_frame(fill)]],
+                              state=np.arange(state, dtype=np.float32), prompt=prompt)
+
+
+def _record(**overrides):
+    from examples.advanced.robocasa.study_telemetry import CallRecord
+
+    base = {"task": "T", "method_id": "m", "seed": 0, "call_index": 0,
+            "prompt_sha256": "a" * 64, "latency_s": 0.5, "parse_ok": True}
+    return CallRecord(**{**base, **overrides})
+
+
+def test_the_prompt_digest_covers_the_image_not_just_the_instruction():
+    """An action chunk depends on what the policy saw, so a transcript keyed on
+    the instruction alone would return the same answer at every step."""
+    from examples.advanced.robocasa.study_transcript import assemble_prompt, prompt_digest
+
+    same = prompt_digest(assemble_prompt(_observation(0)))
+    assert same == prompt_digest(assemble_prompt(_observation(0)))
+    assert same != prompt_digest(assemble_prompt(_observation(1)))
+    assert same != prompt_digest(assemble_prompt(_observation(0, prompt="other"))) 
+    assert same != prompt_digest(assemble_prompt(_observation(0, state=6)))
+
+
+def test_the_image_is_hashed_not_embedded():
+    """A 128x128x3 frame is 49 kB; a transcript carrying them would be
+    unusable, and a digest over the bytes is exact."""
+    from examples.advanced.robocasa.study_transcript import assemble_prompt
+
+    prompt = assemble_prompt(policy_observation(
+        frames=[[_frame(size=128)]], state=np.zeros(5), prompt="go"))
+    assert len(prompt) < 400
+    assert "image_sha256" in prompt
+
+
+def test_a_configuration_changes_the_digest_so_two_cannot_collide():
+    from examples.advanced.robocasa.study_transcript import assemble_prompt, prompt_digest
+
+    plain = prompt_digest(assemble_prompt(_observation()))
+    configured = prompt_digest(assemble_prompt(_observation(), config={"variant": "terse"}))
+    assert plain != configured
+
+
+def test_a_recorded_call_replays_exactly():
+    from examples.advanced.robocasa.study_transcript import TranscriptMethod, TranscriptRecorder
+
+    recorder = TranscriptRecorder(method=StillMethod(horizon=3))
+    original = recorder.predict(_observation())
+    replayed = TranscriptMethod(store=recorder.store, dof=7).predict(_observation())
+    assert np.allclose(replayed.actions, original.actions)
+    assert replayed.horizon == original.horizon == 3
+
+
+def test_a_recorder_stores_only_what_it_knows():
+    """Inventing token or cost figures would fabricate the numbers a study
+    measures, and a measured latency would make the file differ every time."""
+    from examples.advanced.robocasa.study_transcript import TranscriptRecorder
+
+    recorder = TranscriptRecorder(method=StillMethod(horizon=2))
+    recorder.predict(_observation())
+    entry = next(iter(recorder.store.entries.values()))
+    assert set(entry) == {"response", "model_id"}
+
+
+def test_a_recorder_can_attach_a_providers_reported_cost():
+    from examples.advanced.robocasa.study_transcript import TranscriptRecorder
+
+    recorder = TranscriptRecorder(
+        method=StillMethod(horizon=2), model_id="fake:model",
+        report_cost=lambda: {"prompt_tokens": 90, "usd": 0.003, "latency_s": 0.4})
+    recorder.predict(_observation())
+    entry = next(iter(recorder.store.entries.values()))
+    assert entry["usd"] == 0.003 and entry["model_id"] == "fake:model"
+    assert recorder.ledger.telemetry[0]["recorded_latency_s"] == 0.4
+
+
+def test_a_transcript_miss_is_refused_and_measured():
+    """No fallback: answering from a scripted policy would mix scripted
+    behaviour into a replayed arm's results."""
+    from examples.advanced.robocasa.study_transcript import (
+        InvalidPolicyOutput, TranscriptMethod, TranscriptRecorder)
+
+    recorder = TranscriptRecorder(method=StillMethod(horizon=2))
+    recorder.predict(_observation(0))
+    method = TranscriptMethod(store=recorder.store, dof=7)
+    with pytest.raises(InvalidPolicyOutput, match="no recorded call"):
+        method.predict(_observation(1))
+    row = method.ledger.telemetry[-1]
+    assert row["transcript_hit"] is False and row["parse_ok"] is False
+
+
+@pytest.mark.parametrize("text,expected", (
+    ("", "empty"), ("   ", "empty"), (None, "empty"),
+    ("no json here", "no JSON array"),
+    ("[]", "non-empty list"),
+    ("[[1,2]]", "must each have 7"),
+    ("[[0,0,0,0,0,0,0],[0,0,0]]", "must each have 7"),
+    ("[[0,0,0,0,0,0,9]]", "normalised action bound"),
+    ('[[0,0,0,0,0,0,"x"]]', "non-numeric"),
+    ("[[0,0,0,0,0,0,null]]", "non-finite"),
+))
+def test_an_unusable_chunk_response_is_refused(text, expected):
+    from examples.advanced.robocasa.study_transcript import (
+        InvalidPolicyOutput, parse_chunk_response)
+
+    with pytest.raises(InvalidPolicyOutput, match=expected):
+        parse_chunk_response(text, dof=7)
+
+
+def test_a_packaged_response_still_parses():
+    from examples.advanced.robocasa.study_transcript import parse_chunk_response
+
+    fenced = "Here you go:\n```json\n[[0.1,0,0,0,0,0,-1]]\n```\nDone."
+    assert parse_chunk_response(fenced, dof=7).shape == (1, 7)
+
+
+def test_an_overlong_chunk_is_refused_before_the_envelope_sees_it():
+    from examples.advanced.robocasa.study_transcript import (
+        MAX_HORIZON, InvalidPolicyOutput, parse_chunk_response)
+
+    rows = json_loads(f"[{','.join(['[0,0,0,0,0,0,0]'] * (MAX_HORIZON + 1))}]")
+    import json as _json
+
+    with pytest.raises(InvalidPolicyOutput, match="exceeds the bound"):
+        parse_chunk_response(_json.dumps(rows), dof=7)
+
+
+def test_the_store_rejects_a_malformed_document(tmp_path):
+    from examples.advanced.robocasa.study_transcript import TranscriptStore
+
+    with pytest.raises(ValueError, match="not a sha256 digest"):
+        TranscriptStore({"short": {"response": "[]"}})
+    with pytest.raises(ValueError, match="no response"):
+        TranscriptStore({"a" * 64: {"nope": 1}})
+    with pytest.raises(FileNotFoundError):
+        TranscriptStore.from_path(tmp_path / "absent.json")
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"schema_version": 99, "calls": {}}')
+    with pytest.raises(ValueError, match="unsupported transcript schema"):
+        TranscriptStore.from_path(bad)
+
+
+def test_a_transcript_round_trips_through_a_file(tmp_path):
+    from examples.advanced.robocasa.study_transcript import TranscriptRecorder, TranscriptStore
+
+    recorder = TranscriptRecorder(method=StillMethod(horizon=2))
+    recorder.predict(_observation())
+    path = recorder.store.write(tmp_path / "t.json")
+    loaded = TranscriptStore.from_path(path)
+    assert len(loaded) == 1 and len(loaded.source_sha256) == 64
+
+
+def test_an_unset_transcript_path_fails_rather_than_degrading(monkeypatch):
+    from examples.advanced.robocasa.study_transcript import (
+        TRANSCRIPT_ENV, EnvTranscriptMethod)
+
+    monkeypatch.delenv(TRANSCRIPT_ENV, raising=False)
+    with pytest.raises(ValueError, match=TRANSCRIPT_ENV):
+        EnvTranscriptMethod()
+
+
+def test_the_ledger_keeps_the_deterministic_and_measured_halves_apart():
+    """A caller that mixed them would produce a record that can never be
+    compared across runs."""
+    from examples.advanced.robocasa.study_telemetry import NONDETERMINISTIC_FIELDS
+    from examples.advanced.robocasa.study_transcript import TranscriptRecorder
+
+    recorder = TranscriptRecorder(method=StillMethod(horizon=2))
+    recorder.predict(_observation())
+    canonical, = recorder.ledger.canonical
+    assert set(canonical) == {"call_index", "prompt_sha256", "horizon"}
+    assert all(field not in canonical for field in NONDETERMINISTIC_FIELDS)
+    assert "latency_s" in recorder.ledger.telemetry[0]
+
+
+@pytest.mark.parametrize("field,value", (
+    ("task", ""), ("method_id", ""),
+    ("call_index", -1), ("call_index", 1.0),
+    ("prompt_sha256", "short"), ("latency_s", -0.1), ("latency_s", 1),
+    ("prompt_tokens", -1), ("usd", -0.01), ("usd", 1), ("horizon", -1),
+))
+def test_an_unusable_call_record_is_rejected(field, value):
+    with pytest.raises(ValueError):
+        _record(**{field: value})
+
+
+def test_the_sidecar_round_trips_and_joins(tmp_path):
+    from examples.advanced.robocasa.study_telemetry import (
+        SIDECAR_NAME, read_sidecar, verify_join, write_sidecar)
+
+    write_sidecar(tmp_path, [_record(call_index=0), _record(call_index=1)])
+    assert (tmp_path / SIDECAR_NAME).is_file()
+    rows = read_sidecar(tmp_path)
+    ledger = [{"call_index": i, "prompt_sha256": "a" * 64} for i in (0, 1)]
+    assert verify_join(ledger, rows)["joined"]
+
+
+def test_a_digest_mismatch_breaks_the_join():
+    """So a sidecar cannot be silently attached to another run's results."""
+    from examples.advanced.robocasa.study_telemetry import verify_join
+
+    verdict = verify_join([{"call_index": 0, "prompt_sha256": "b" * 64}],
+                          [_record().to_dict()])
+    assert not verdict["joined"]
+    assert "prompt digest disagrees" in " ".join(verdict["errors"])
+
+
+def test_a_gap_in_call_indices_breaks_the_join():
+    from examples.advanced.robocasa.study_telemetry import verify_join
+
+    rows = [_record(call_index=0).to_dict(), _record(call_index=2).to_dict()]
+    ledger = [{"call_index": 0, "prompt_sha256": "a" * 64},
+              {"call_index": 2, "prompt_sha256": "a" * 64}]
+    assert "complete ordered sequence" in " ".join(verify_join(ledger, rows)["errors"])
+
+
+def test_an_absent_sidecar_reads_as_empty(tmp_path):
+    from examples.advanced.robocasa.study_telemetry import read_sidecar
+
+    assert read_sidecar(tmp_path) == []
+
+
+def test_absent_cost_is_reported_absent_rather_than_zero():
+    """Summing a missing count as zero quietly understates the cost a study
+    exists to measure."""
+    from examples.advanced.robocasa.study_telemetry import projected_cost
+
+    summary = projected_cost([_record().to_dict()])
+    assert summary["prompt_tokens"] is None
+    assert summary["prompt_tokens_reported_by"] == 0
+
+
+def test_reported_cost_is_totalled_with_its_denominator():
+    from examples.advanced.robocasa.study_telemetry import projected_cost
+
+    rows = [_record(call_index=0, prompt_tokens=10, usd=0.002).to_dict(),
+            _record(call_index=1).to_dict()]
+    summary = projected_cost(rows)
+    assert summary["prompt_tokens"] == 10 and summary["prompt_tokens_reported_by"] == 1
+    assert summary["usd"] == 0.002 and summary["calls"] == 2
+
+
+def test_the_two_latencies_are_separate_fields():
+    """A replayed call's measured latency is a dictionary lookup; reporting it
+    as model latency would understate it by orders of magnitude."""
+    row = _record(latency_s=0.001, recorded_latency_s=2.4).to_dict()
+    assert row["latency_s"] != row["recorded_latency_s"]
