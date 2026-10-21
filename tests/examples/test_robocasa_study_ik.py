@@ -625,3 +625,110 @@ def test_the_chained_pipeline_picks_the_object_up(clean_env):
     risen = float(_object_position(env)[2] - start[2])
     assert risen > 0.05, f"the object should leave the counter, rose {risen:.4f}"
     assert grasped(), "and still be held at the top of the lift"
+
+
+# --- the joint-delta control path ----------------------------------------
+#
+# The reference policy and the study's representation axis meet here: the
+# policy emits normalised joint deltas and the environment turns them into the
+# absolute joint targets the JOINT_POSITION controller wants. Both halves are
+# measured against a live model, because the controller's interpretation of a
+# row is the thing that cannot be read off any documentation.
+
+
+@pytest.fixture
+def joint_world():
+    """A fresh joint-mode environment, reset and ready to step."""
+    from examples.advanced.robocasa.method_harness import TrialRequest
+    from examples.advanced.robocasa.study_robocasa_env import RoboCasaPnPEnvironment
+
+    world = RoboCasaPnPEnvironment(task=TASK, representation="joint_delta")
+    world.reset(TrialRequest(method_id="test", task=TASK, seed=0, max_steps=10))
+    yield world
+    world.close()
+
+
+def test_a_joint_representation_selects_the_joint_position_controller(joint_world):
+    """The default composite drives operational space and would read the row as a pose."""
+    config = joint_world.env.robots[0].composite_controller_config
+    assert config["body_parts"]["right"]["type"] == "JOINT_POSITION"
+    assert config["body_parts"]["right"]["input_type"] == "absolute"
+
+
+def test_a_zero_joint_delta_row_holds_the_posture(joint_world):
+    before = joint_world.arm.joints().copy()
+    for _ in range(20):
+        joint_world.step(np.zeros(8, dtype=np.float32))
+    assert np.linalg.norm(joint_world.arm.joints() - before) < 0.05
+
+
+def test_a_held_joint_delta_row_integrates(joint_world):
+    """A delta is relative to the *live* posture, so holding a row ratchets.
+
+    This is the property a policy author has to know and the one a test written
+    against the wrong mental model gets backwards: one action commands one
+    scale-step away from wherever the arm is now, so the same row repeated walks
+    the joint rather than converging on a fixed target. That is what keeps the
+    representation inside the envelope's bound while still being able to cross
+    the workspace, and it is why the reference recomputes its command every
+    call instead of issuing a target once.
+    """
+    from examples.advanced.robocasa.study_representations import JOINT_DELTA_SCALE
+
+    before = joint_world.arm.joints().copy()
+    row = np.zeros(8, dtype=np.float32)
+    row[0] = 1.0
+    row[7] = -1.0
+    joint_world.step(row)
+    after_one = joint_world.arm.joints()[0] - before[0]
+    for _ in range(39):
+        joint_world.step(row)
+    after_forty = joint_world.arm.joints()[0] - before[0]
+    assert 0.0 < after_one < JOINT_DELTA_SCALE  # one step, still tracking
+    assert after_forty > 10 * after_one  # and it keeps going
+    # Integrating does not escape the joint's own limits.
+    assert np.all(joint_world.arm.joints() <= joint_world.arm.limits[:, 1])
+    assert np.all(joint_world.arm.joints() >= joint_world.arm.limits[:, 0])
+
+
+def test_the_joint_path_returns_a_transition(joint_world):
+    transition = joint_world.step(np.zeros(8, dtype=np.float32))
+    assert isinstance(transition.reward, float)
+    assert transition.terminated in (True, False)
+    assert transition.observation.state.shape[0] > 0
+
+
+# --- the reference policy, end to end ------------------------------------
+
+
+def test_the_reference_reaches_grasps_and_lifts_through_the_harness():
+    """The measurement this whole lane exists to make possible.
+
+    Every method in the study scored zero before this: a success rate and a
+    partial score cannot separate policies when none of them can engage the
+    object. This runs the scripted reference through the real harness - the same
+    `SafetyEnvelope`, the same normalised action bound, the same one-row-per-
+    control-step dispatch a model policy gets - and pins the three rungs it
+    climbs. The top rung needs transport and release, which is not built.
+    """
+    from examples.advanced.robocasa.method_harness import (
+        MethodHarness, SafetyEnvelope, TrialRequest)
+    from examples.advanced.robocasa.study_reference import ScriptedPickMethod
+    from examples.advanced.robocasa.study_robocasa_env import RoboCasaPnPEnvironment
+
+    world = RoboCasaPnPEnvironment(task=TASK, representation="joint_delta")
+    method = ScriptedPickMethod(environment=world, horizon=1)
+    try:
+        report = MethodHarness(safety=SafetyEnvelope()).run(
+            TrialRequest(method_id="scripted-pick", task=TASK, seed=0, max_steps=2200),
+            environment=world, method=method, close_environment=False)
+        assert report.error == ""
+        assert method.failures == [], method.failures
+        rungs = world.progress.rungs
+        assert rungs["reached"] and rungs["grasped"] and rungs["lifted"]
+        assert world.progress.score == 75
+        # One model call per control step at horizon 1, which is what makes the
+        # gate exact and the horizon axis measurable against it.
+        assert method.calls == report.steps
+    finally:
+        world.close()

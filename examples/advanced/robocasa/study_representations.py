@@ -40,6 +40,7 @@ REPRESENTATIONS = (
     "joint_velocity", # (dq0..dq6, gripper)
     "joint_position", # (q0..q6, gripper)
     "eef_delta_base", # (dx, dy, dz, drx, dry, drz, gripper, base_x, base_y, base_yaw)
+    "joint_delta",    # (dq0..dq6, gripper), each normalised to [-1, 1]
 )
 
 #: Width of one action row per representation, gripper command included.
@@ -49,6 +50,7 @@ REPRESENTATION_DOF = {
     "joint_velocity": 8,
     "joint_position": 8,
     "eef_delta_base": 10,
+    "joint_delta": 8,
 }
 
 
@@ -143,3 +145,31 @@ def normalised_dof(representation: str) -> int:
             f"unknown representation {representation!r}; "
             f"available: {', '.join(REPRESENTATIONS)}")
     return REPRESENTATION_DOF[representation]
+
+
+#: Radians of joint motion one unit of a normalised `joint_delta` commands. The
+#: `SafetyEnvelope` bounds every action element to 1.0, and a joint target is in
+#: radians up to about 3, so a joint representation has to be a *delta* on a
+#: declared scale rather than an absolute target. The scale is a little above
+#: the planner's own step so a policy can always command a full step.
+JOINT_DELTA_SCALE = 0.05
+
+
+def joint_targets(current, row, *, scale: float = JOINT_DELTA_SCALE):
+    """Turn a normalised joint-delta row into absolute joint targets.
+
+    Returns `(targets, gripper)`. Clipping to the normalised bound happens here
+    rather than being assumed of the caller, so a policy that over-commands is
+    limited in one place and the limit is the same one the envelope enforces.
+    """
+    values = np.asarray(row, dtype=np.float32)
+    if values.shape != (REPRESENTATION_DOF["joint_delta"],):
+        raise ValueError(
+            f"joint_delta rows must have shape ({REPRESENTATION_DOF['joint_delta']},), "
+            f"got {values.shape}")
+    if not np.isfinite(values).all():
+        raise ValueError("action row contains a non-finite value")
+    if type(scale) is not float or not 0.0 < scale <= 1.0:
+        raise ValueError("scale must be a float in (0, 1]")
+    deltas = np.clip(values[:7], -1.0, 1.0) * scale
+    return np.asarray(current, dtype=np.float64) + deltas, float(values[7])

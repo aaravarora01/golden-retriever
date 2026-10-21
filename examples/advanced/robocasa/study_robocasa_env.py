@@ -69,7 +69,11 @@ CAMERA_ROLES = {
     "wrist": "robot0_eye_in_hand",
 }
 #: Representations this backend can express natively; see `study_representations`.
-SUPPORTED_REPRESENTATIONS = ("eef_delta", "eef_absolute", "eef_delta_base")
+SUPPORTED_REPRESENTATIONS = ("eef_delta", "eef_absolute", "eef_delta_base",
+                            "joint_delta")
+#: Representations that need the arm driven in joint space rather than
+#: operational space, which is a different composite controller.
+JOINT_REPRESENTATIONS = ("joint_delta",)
 #: Arm-plus-gripper width exposed to a policy.
 EXPOSED_DOF = 7
 _ARM = slice(0, 6)
@@ -127,6 +131,7 @@ class RoboCasaPnPEnvironment:
     specification_style: str = "default"
     env: object = None
     codec: EefDeltaCodec | None = None
+    arm: object = None
     progress: ProgressTracker = field(default_factory=ProgressTracker)
     prompt: str = ""
     specification: dict = field(default_factory=dict)
@@ -135,6 +140,8 @@ class RoboCasaPnPEnvironment:
     _last_raw: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.representation in JOINT_REPRESENTATIONS and self.command_base:
+            raise ValueError("a joint representation does not command the base")
         if self.representation not in SUPPORTED_REPRESENTATIONS:
             raise UnsupportedRepresentation(
                 f"the RoboCasa backend cannot express {self.representation!r}; "
@@ -157,7 +164,15 @@ class RoboCasaPnPEnvironment:
         from robosuite.controllers import load_composite_controller_config
 
         self.close()
-        config = load_composite_controller_config(robot=self.robot)
+        if self.representation in JOINT_REPRESENTATIONS:
+            # A joint representation needs the arm's body-part controller in
+            # joint space; the default composite drives operational space and
+            # would reinterpret the row as a pose.
+            from .study_ik import joint_position_controller_config
+
+            config = joint_position_controller_config(self.robot)
+        else:
+            config = load_composite_controller_config(robot=self.robot)
         self.env = robosuite.make(
             self.task, robots=self.robot, controller_configs=config,
             has_renderer=False, has_offscreen_renderer=True, use_camera_obs=True,
@@ -167,7 +182,12 @@ class RoboCasaPnPEnvironment:
             seed=request.seed, layout_ids=[self.layout_id], style_ids=[self.style_id],
         )
         raw = self.env.reset()
-        self.codec = EefDeltaCodec(self.representation)
+        if self.representation in JOINT_REPRESENTATIONS:
+            from .study_ik import ArmModel
+
+            self.arm, self.codec = ArmModel(env=self.env), None
+        else:
+            self.arm, self.codec = None, EefDeltaCodec(self.representation)
         self.progress = ProgressTracker()
         self._frames = []
         self._last_success = False
@@ -187,6 +207,8 @@ class RoboCasaPnPEnvironment:
         return self._observation(raw)
 
     def step(self, action):
+        if self.representation in JOINT_REPRESENTATIONS:
+            return self._step_joints(action)
         row = self.codec.to_delta(
             action,
             current_position=self._eef_position(),
@@ -208,6 +230,23 @@ class RoboCasaPnPEnvironment:
         self._track(raw)
         from .method_harness import Transition
 
+        return Transition(observation=self._observation(raw), reward=float(reward),
+                          terminated=bool(done) or self._last_success)
+
+    def _step_joints(self, action):
+        """Apply a normalised joint-delta row as absolute joint targets."""
+        from .method_harness import Transition
+        from .study_representations import joint_targets
+
+        targets, gripper = joint_targets(self.arm.joints(), action)
+        full = np.zeros(self.env.action_dim, dtype=np.float32)
+        full[0:7] = self.arm.clamp(targets)
+        full[7] = gripper
+        # The trailing element selects arm mode rather than base mode; the base
+        # and torso segments stay at zero as in the operational-space path.
+        full[-1] = -1.0
+        raw, reward, done, _ = self.env.step(full)
+        self._track(raw)
         return Transition(observation=self._observation(raw), reward=float(reward),
                           terminated=bool(done) or self._last_success)
 

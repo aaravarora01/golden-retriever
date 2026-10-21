@@ -1291,3 +1291,262 @@ def test_every_committed_task_has_both_specification_styles():
         assert all(text.strip() for text in texts.values())
         # The two conditions must differ, or the axis does nothing.
         assert texts["default"] != texts["vague"]
+
+
+# --- the joint-delta representation --------------------------------------
+#
+# The reference policy drives joint targets, and the envelope bounds every
+# action element to 1.0 while a joint target is in radians up to about 3. So
+# the representation has to be a *normalised* delta, and these pin that it is.
+
+
+def test_joint_delta_is_a_declared_representation():
+    from examples.advanced.robocasa.study_representations import (
+        REPRESENTATION_DOF, REPRESENTATIONS)
+
+    assert "joint_delta" in REPRESENTATIONS
+    assert REPRESENTATION_DOF["joint_delta"] == 8
+
+
+def test_a_joint_delta_row_scales_into_joint_targets():
+    from examples.advanced.robocasa.study_representations import JOINT_DELTA_SCALE, joint_targets
+
+    current = np.zeros(7)
+    targets, gripper = joint_targets(current, np.array([1.0, -1.0, 0.0, 0, 0, 0, 0, 1.0]))
+    assert targets[0] == pytest.approx(JOINT_DELTA_SCALE)
+    assert targets[1] == pytest.approx(-JOINT_DELTA_SCALE)
+    assert targets[2] == pytest.approx(0.0)
+    assert gripper == 1.0
+
+
+def test_a_joint_delta_row_is_clipped_before_scaling():
+    """An out-of-band row cannot command a larger step than the scale allows."""
+    from examples.advanced.robocasa.study_representations import JOINT_DELTA_SCALE, joint_targets
+
+    targets, _ = joint_targets(np.zeros(7), np.array([9.0, -9.0, 0, 0, 0, 0, 0, 0.0]))
+    assert targets[0] == pytest.approx(JOINT_DELTA_SCALE)
+    assert targets[1] == pytest.approx(-JOINT_DELTA_SCALE)
+
+
+def test_a_joint_delta_row_is_added_to_the_current_posture():
+    """It is a delta, not a target: the same row from elsewhere lands elsewhere."""
+    from examples.advanced.robocasa.study_representations import joint_targets
+
+    row = np.array([1.0, 0, 0, 0, 0, 0, 0, 0.0])
+    first, _ = joint_targets(np.zeros(7), row)
+    second, _ = joint_targets(np.full(7, 0.5), row)
+    assert np.allclose(second - first, 0.5)
+
+
+@pytest.mark.parametrize("row", [np.zeros(7), np.zeros(9)])
+def test_a_misshaped_joint_delta_row_is_rejected(row):
+    from examples.advanced.robocasa.study_representations import joint_targets
+
+    with pytest.raises(ValueError, match="joint_delta"):
+        joint_targets(np.zeros(7), row)
+
+
+def test_a_non_finite_joint_delta_row_is_rejected():
+    from examples.advanced.robocasa.study_representations import joint_targets
+
+    with pytest.raises(ValueError):
+        joint_targets(np.zeros(7), np.array([np.nan, 0, 0, 0, 0, 0, 0, 0.0]))
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.1, 2.0, 1])
+def test_an_unusable_joint_delta_scale_is_rejected(scale):
+    from examples.advanced.robocasa.study_representations import joint_targets
+
+    with pytest.raises(ValueError, match="scale"):
+        joint_targets(np.zeros(7), np.zeros(8), scale=scale)
+
+
+def test_a_joint_representation_does_not_command_the_base():
+    """The joint path drives seven arm joints; a base command has nowhere to go."""
+    from examples.advanced.robocasa.study_robocasa_env import RoboCasaPnPEnvironment
+
+    with pytest.raises(ValueError, match="does not command the base"):
+        RoboCasaPnPEnvironment(task="PickPlaceCounterToCabinet",
+                               representation="joint_delta", command_base=True)
+
+
+# --- the scripted reference ----------------------------------------------
+
+
+class _FakeArm:
+    """Enough of `ArmModel` to exercise the phase machine without MuJoCo."""
+
+    def __init__(self, env, joints=None):
+        self.env = env
+        self.posture = np.zeros(7) if joints is None else np.asarray(joints, dtype=float)
+
+    def joints(self):
+        return self.posture.copy()
+
+    def hand(self):
+        return np.array([0.4, -0.3, 1.0])
+
+
+class _StubbedWorld:
+    """Stands in for `RoboCasaPnPEnvironment`; the reference only reads `.env`."""
+
+    env = object()
+
+
+def _reference(**kwargs):
+    from examples.advanced.robocasa.study_reference import ScriptedPickMethod
+
+    method = ScriptedPickMethod(environment=_StubbedWorld(), **kwargs)
+    method._arm = _FakeArm(method.environment.env)
+    method._start_height = 0.9
+    method._object_position = lambda: np.array([0.4, -0.3, 0.9])  # type: ignore[method-assign]
+    method._grasped = lambda: False  # type: ignore[method-assign]
+    return method
+
+
+@pytest.mark.parametrize("horizon", [0, 33, 1.0, "5"])
+def test_the_reference_rejects_an_unusable_horizon(horizon):
+    from examples.advanced.robocasa.study_reference import ScriptedPickMethod
+
+    with pytest.raises(ValueError, match="horizon"):
+        ScriptedPickMethod(environment=_StubbedWorld(), horizon=horizon)
+
+
+@pytest.mark.parametrize("name", ["grasp_height", "lift_height"])
+def test_the_reference_rejects_an_unusable_height(name):
+    from examples.advanced.robocasa.study_reference import ScriptedPickMethod
+
+    with pytest.raises(ValueError, match=name):
+        ScriptedPickMethod(environment=_StubbedWorld(), **{name: 0.0})
+
+
+def test_the_reference_stages_above_the_object_then_descends_to_it():
+    """The approach target clears the object; the grasp target straddles it."""
+    from examples.advanced.robocasa.study_reference import APPROACH_HEIGHT
+
+    method = _reference()
+    above = method._target_for("approach")
+    grasp = method._target_for("descend")
+    assert above[2] - 0.9 == pytest.approx(APPROACH_HEIGHT)
+    assert grasp[2] - 0.9 == pytest.approx(method.grasp_height)
+    assert above[2] > grasp[2]
+
+
+def test_the_reference_lifts_straight_up_from_wherever_it_grasped():
+    """The lift keeps x and y: dragging a held object sideways drops it."""
+    method = _reference()
+    target = method._target_for("lift")
+    assert target[0] == pytest.approx(0.4)
+    assert target[1] == pytest.approx(-0.3)
+    assert target[2] == pytest.approx(0.9 + method.lift_height)
+
+
+def test_the_reference_emits_one_row_per_horizon_step_within_the_bound():
+    method = _reference(horizon=5)
+    method.phase = "close"
+    chunk = method.predict(_observation())
+    assert chunk.actions.shape == (5, 8)
+    assert chunk.horizon == 5 and chunk.dof == 8
+    assert np.abs(chunk.actions).max() <= 1.0
+
+
+def test_the_reference_output_passes_the_safety_envelope():
+    """Whatever the phase, the reference is held to the bound every method is."""
+    from examples.advanced.robocasa.method_harness import SafetyEnvelope
+
+    envelope = SafetyEnvelope()
+    for phase in ("close", "done"):
+        method = _reference(horizon=3)
+        method.phase = phase
+        envelope.validate(method.predict(_observation()))
+
+
+def test_the_reference_opens_the_gripper_before_the_grasp_and_closes_after():
+    method = _reference()
+    method.phase = "descend"
+    assert method._row()[7] == -1.0
+    method.phase = "lift"
+    assert method._row()[7] == 1.0
+
+
+def test_the_reference_holds_still_once_done():
+    method = _reference()
+    method.phase = "done"
+    row = method._row()
+    assert np.allclose(row[:7], 0.0)
+    assert row[7] == 1.0
+
+
+def test_the_reference_closes_for_the_declared_window_then_advances():
+    from examples.advanced.robocasa.study_reference import CLOSE_STEPS
+
+    method = _reference()
+    method.phase = "close"
+    method._plan_for = lambda phase: False  # type: ignore[method-assign]
+    for _ in range(CLOSE_STEPS - 1):
+        method._row()
+    assert method.phase == "close"
+    method._row()
+    assert method.phase != "close"
+
+
+def test_a_phase_that_cannot_be_planned_is_skipped_rather_than_retried():
+    """An unplannable phase ends the episode on the rung it reached."""
+    method = _reference()
+    method._plan_for = lambda phase: False  # type: ignore[method-assign]
+    method.phase = "close"
+    method.closed_for = 10 ** 6
+    method._row()
+    assert method.phase == "done"
+
+
+def test_the_reference_gates_the_command_on_the_arm():
+    """The command leads the arm by at most the follow tolerance."""
+    from examples.advanced.robocasa.study_reference import FOLLOW_INCREMENT, FOLLOW_TOLERANCE
+
+    method = _reference()
+    goal = np.full(7, 1.0)
+    method._path, method._leg, method._travelled = [np.zeros(7), goal], 1, 0.0
+    first = method._commanded_point()
+    assert np.linalg.norm(first) == pytest.approx(FOLLOW_INCREMENT)
+    # The arm never moves here, so however many times it is asked, the command
+    # cannot run away down the leg - it stalls one increment past the tolerance
+    # and waits. That bound is the whole mechanism keeping executed motion on
+    # the planner's verified line rather than on a route of its own.
+    for _ in range(200):
+        method._commanded_point()
+    assert np.linalg.norm(method.arm.joints()) == 0.0
+    assert method._travelled <= FOLLOW_TOLERANCE + FOLLOW_INCREMENT + 1e-9
+    assert method._leg == 1
+
+
+def test_the_reference_settles_at_a_leg_before_starting_the_next():
+    """Reaching the end of a leg is not arriving at it.
+
+    Advancing immediately left the hand 2.5 cm above the object and closed the
+    fingers on each other, so each leg holds its target for a settle window.
+    """
+    from examples.advanced.robocasa.study_reference import FOLLOW_SETTLE
+
+    method = _reference()
+    target = np.full(7, 0.001)
+    method._path, method._leg, method._travelled = [np.zeros(7), target, np.full(7, 0.002)], 1, 0.0
+    method._commanded_point()  # travels the whole (tiny) leg in one step
+    assert method._travelled > 0
+    held = [method._commanded_point() for _ in range(FOLLOW_SETTLE)]
+    assert all(np.allclose(point, target) for point in held[:-1])
+    assert method._leg == 2
+
+
+def test_the_reference_reports_its_privilege():
+    """It reads the simulator, so it is a reference and must say so."""
+    method = _reference()
+    assert method.describe()["privileged"] is True
+
+
+def test_the_reference_records_why_a_plan_failed():
+    """A phase that silently does not happen is the hardest kind of bug."""
+    method = _reference()
+    method._target_for = lambda phase: None  # type: ignore[method-assign]
+    assert method._plan_for("lift") is False
+    assert method.failures[0]["reason"] == "no target"

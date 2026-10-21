@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 
 from .study_methods import RandomMethod, StillMethod
+from .study_reference import ScriptedPickMethod
 from .study_sweep import MethodSpec, Sweep, render
 from .study_tasks import DEFAULT_SEEDS, ablation_subset, get_task, list_tasks
 
@@ -30,6 +31,21 @@ def baseline_specs(horizon: int, representation: str) -> tuple:
                    label="bounded seeded random motion",
                    build=lambda env, h=horizon, r=representation: RandomMethod(
                        horizon=h, representation=r, seed=0)),
+    )
+
+
+def reference_specs(horizon: int) -> tuple:
+    """The scripted reference, which is privileged and drives joint deltas.
+
+    It reads the object's pose from the simulator, so it is a ceiling to read
+    policies against rather than an entry in the comparison. Its representation
+    is fixed: the pipeline behind it commands joint targets, and asking for an
+    end-effector representation would silently reinterpret its rows.
+    """
+    return (
+        MethodSpec(method_id="scripted-pick", horizon=horizon, representation="joint_delta",
+                   label="privileged reach, grasp and lift; the ceiling, not a policy",
+                   build=lambda env, h=horizon: ScriptedPickMethod(environment=env, horizon=h)),
     )
 
 
@@ -51,6 +67,10 @@ def main(argv=None) -> int:
     parser.add_argument("--specification", choices=("default", "vague"), default="default",
                         help="Task-specification axis: RoboCasa's goal, or the derived "
                              "instruction that withholds the object's identity.")
+    parser.add_argument("--methods", choices=("baselines", "reference", "both"),
+                        default="baselines",
+                        help="Which arms to run. The reference is privileged and always "
+                             "uses joint_delta, whatever --representation says.")
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -69,9 +89,14 @@ def main(argv=None) -> int:
             tasks = list_tasks()
         else:
             tasks = ablation_subset(args.subset)
+        specs = ()
+        if args.methods in ("baselines", "both"):
+            specs += baseline_specs(args.horizon, args.representation)
+        if args.methods in ("reference", "both"):
+            specs += reference_specs(args.horizon)
         sweep = Sweep(build_environment=build, tasks=tasks,
                       seeds=tuple(args.seeds), max_steps=args.max_steps)
-        summary = sweep.run(baseline_specs(args.horizon, args.representation))
+        summary = sweep.run(specs)
     except (ValueError, TypeError, OSError) as error:
         print(render({"error": f"{type(error).__name__}: {error}"}))
         return 1
