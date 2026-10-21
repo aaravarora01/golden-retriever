@@ -218,6 +218,35 @@ def to_native_action(row) -> np.ndarray:
     return values[list(NATIVE_FROM_LEROBOT)]
 
 
+def _rotation(quaternion) -> np.ndarray:
+    """Rotation matrix for an `(x, y, z, w)` quaternion.
+
+    Written out rather than imported so the state assembly stays testable
+    without a simulator; cross-checked against robosuite's own
+    `transform_utils` in the simulator-backed suite.
+    """
+    x, y, z, w = (float(v) for v in quaternion)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _relative(base, hand) -> np.ndarray:
+    """The rotation taking the base frame to the hand frame, `(x, y, z, w)`."""
+    bx, by, bz, bw = (float(v) for v in base)
+    # Inverse of a unit quaternion is its conjugate.
+    bx, by, bz = -bx, -by, -bz
+    hx, hy, hz, hw = (float(v) for v in hand)
+    return np.array([
+        bw * hx + bx * hw + by * hz - bz * hy,
+        bw * hy - bx * hz + by * hw + bz * hx,
+        bw * hz + bx * hy - by * hx + bz * hw,
+        bw * hw - bx * hx - by * hy - bz * hz,
+    ])
+
+
 def _canonical(quaternion) -> np.ndarray:
     """Flip a quaternion to the `w >= 0` half, the convention in the data.
 
@@ -237,8 +266,6 @@ def lerobot_state(raw) -> np.ndarray:
     checkpoint was trained on; see `LEROBOT_STATE_KEYS` for how that was
     established.
     """
-    from robosuite.utils.transform_utils import quat2mat, quat_inverse, quat_multiply
-
     for key in LEROBOT_STATE_KEYS:
         if key not in raw:
             raise KeyError(f"observation is missing {key!r}")
@@ -250,10 +277,8 @@ def lerobot_state(raw) -> np.ndarray:
     gripper = np.asarray(raw["robot0_gripper_qpos"], dtype=np.float64).reshape(-1)
     if base_quaternion.shape != (4,) or hand_quaternion.shape != (4,):
         raise ValueError("base and hand quaternions must each be 4 wide")
-    rotation = quat2mat(base_quaternion)
-    relative_position = rotation.T @ (hand_position - base_position)
-    relative_quaternion = _canonical(
-        quat_multiply(quat_inverse(base_quaternion), hand_quaternion))
+    relative_position = _rotation(base_quaternion).T @ (hand_position - base_position)
+    relative_quaternion = _canonical(_relative(base_quaternion, hand_quaternion))
     state = np.concatenate([base_position, base_quaternion, relative_position,
                             relative_quaternion, gripper]).astype(np.float32)
     if state.shape != (LEROBOT_STATE_DOF,):

@@ -91,7 +91,15 @@ class Sweep:
     #: admitting a model's output is a deliberate, recorded widening rather
     #: than a method quietly mislabelling itself to get through.
     allowed_sources: tuple = ("scripted",)
+    #: Append each finished episode to this JSONL and reuse what is already in
+    #: it. A full sweep is hours of simulation and the summary is printed only
+    #: at the end, so without this an interruption at 90% loses everything.
+    #: Keyed on (task, seed, method_id), so a resumed run re-executes exactly
+    #: the cells that did not finish.
+    checkpoint: str = ""
     results: list = field(default_factory=list)
+    #: How many cells came from the checkpoint rather than being run.
+    resumed: int = 0
 
     def run(self, methods) -> dict:
         from .method_harness import MethodHarness, SafetyEnvelope, TrialRequest
@@ -103,11 +111,57 @@ class Sweep:
             raise ValueError("methods contain a duplicate method_id")
         harness = MethodHarness(safety=SafetyEnvelope(
             allowed_sources=frozenset(self.allowed_sources)))
+        finished = self._finished()
         for task in self.tasks:
             for seed in self.seeds:
                 for spec in specs:
-                    self.results.append(self._cell(harness, task, seed, spec, TrialRequest))
+                    key = (task, int(seed), spec.method_id)
+                    if key in finished:
+                        self.results.append(finished[key])
+                        self.resumed += 1
+                        continue
+                    result = self._cell(harness, task, seed, spec, TrialRequest)
+                    self.results.append(result)
+                    self._record(result)
         return self.summarise()
+
+    def _finished(self) -> dict:
+        """Episodes already in the checkpoint, keyed by cell."""
+        import json
+        from pathlib import Path
+
+        if not self.checkpoint:
+            return {}
+        path = Path(self.checkpoint)
+        if not path.exists():
+            return {}
+        done = {}
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                result = EpisodeResult(**row)
+            except (ValueError, TypeError) as error:
+                # A truncated last line is the normal cost of being killed
+                # mid-write; anything else is a checkpoint worth not trusting.
+                raise ValueError(
+                    f"{path}:{number} is not a readable episode record: {error}") from error
+            done[(result.task, int(result.seed), result.method_id)] = result
+        return done
+
+    def _record(self, result) -> None:
+        """Append one finished episode, flushed so a kill cannot lose it."""
+        import json
+        from pathlib import Path
+
+        if not self.checkpoint:
+            return
+        path = Path(self.checkpoint)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(result.to_dict(), sort_keys=True) + "\n")
+            handle.flush()
 
     def _cell(self, harness, task, seed, spec, TrialRequest):
         environment = self.build_environment(task=task, representation=spec.representation)
@@ -168,6 +222,7 @@ class Sweep:
                 "protocol": {"tasks": list(self.tasks), "seeds": list(self.seeds),
                              "max_steps": self.max_steps,
                              "allowed_sources": sorted(self.allowed_sources),
+                             "resumed_episodes": self.resumed,
                              "episodes": len(self.tasks) * len(self.seeds)},
                 "episodes": [row.to_dict() for row in self.results],
                 "summary": summary,

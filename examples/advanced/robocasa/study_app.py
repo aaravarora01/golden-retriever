@@ -99,6 +99,10 @@ def main(argv=None) -> int:
                         default="baselines",
                         help="Which arms to run. The reference is privileged and always "
                              "uses joint_delta, whatever --representation says.")
+    parser.add_argument("--checkpoint", default="",
+                        help="Append finished episodes to this JSONL and resume from it. "
+                             "A full sweep is hours long and the summary prints only at "
+                             "the end, so an interruption otherwise loses everything.")
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -140,7 +144,7 @@ def main(argv=None) -> int:
         sources = ("scripted", "model") if args.methods == "vla" else ("scripted",)
         sweep = Sweep(build_environment=build, tasks=tasks,
                       seeds=tuple(args.seeds), max_steps=args.max_steps,
-                      allowed_sources=sources)
+                      allowed_sources=sources, checkpoint=args.checkpoint)
         summary = sweep.run(specs)
     except (ValueError, TypeError, OSError) as error:
         print(render({"error": f"{type(error).__name__}: {error}"}))

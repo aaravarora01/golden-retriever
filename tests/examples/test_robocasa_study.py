@@ -1929,3 +1929,108 @@ def test_the_vla_flips_frames_to_the_training_convention():
     assert SmolVlaMethod().flip_images is True
     assert SmolVlaMethod().describe()["flip_images"] is True
     assert SmolVlaMethod(flip_images=False).describe()["flip_images"] is False
+
+
+# --- resumable sweeps ----------------------------------------------------
+#
+# A full sweep is hours of simulation and the summary prints only at the end,
+# so an interruption at 90% used to lose everything.
+
+
+def _cell_specs():
+    from examples.advanced.robocasa.study_sweep import MethodSpec
+
+    return (MethodSpec(method_id="still", horizon=2,
+                       build=lambda env: StillMethod(horizon=2)),)
+
+
+def _build_fake(task, representation):
+    return _FakeEnvironment(task=task, representation=representation)
+
+
+def test_a_sweep_without_a_checkpoint_writes_nothing(tmp_path):
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    sweep = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,))
+    sweep.run(_cell_specs())
+    assert list(tmp_path.iterdir()) == []
+    assert sweep.resumed == 0
+
+
+def test_a_checkpointed_sweep_records_every_finished_episode(tmp_path):
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    path = tmp_path / "runs" / "cells.jsonl"
+    sweep = Sweep(build_environment=_build_fake, tasks=("T", "U"), seeds=(0, 1),
+                  checkpoint=str(path))
+    sweep.run(_cell_specs())
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == len(sweep.results) == 4
+    import json as _json
+
+    assert all(_json.loads(line)["task"] in ("T", "U") for line in lines)
+
+
+def test_a_resumed_sweep_reuses_finished_cells_and_runs_only_the_rest(tmp_path):
+    """The point of the checkpoint: an interrupted sweep does not start over."""
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    path = tmp_path / "cells.jsonl"
+    first = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0, 1),
+                  checkpoint=str(path))
+    first.run(_cell_specs())
+    assert first.resumed == 0
+
+    built = []
+
+    def counting(task, representation):
+        built.append(task)
+        return _build_fake(task=task, representation=representation)
+
+    second = Sweep(build_environment=counting, tasks=("T",), seeds=(0, 1, 2),
+                   checkpoint=str(path))
+    summary = second.run(_cell_specs())
+    # Seeds 0 and 1 came from disk; only seed 2 built an environment.
+    assert second.resumed == 2
+    assert len(built) == 1
+    assert len(second.results) == 3
+    assert summary["protocol"]["resumed_episodes"] == 2
+
+
+def test_a_resumed_cell_keeps_its_original_measurements(tmp_path):
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    path = tmp_path / "cells.jsonl"
+    first = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,),
+                  checkpoint=str(path))
+    first.run(_cell_specs())
+    second = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,),
+                   checkpoint=str(path))
+    second.run(_cell_specs())
+    assert second.results[0].to_dict() == first.results[0].to_dict()
+
+
+def test_a_corrupt_checkpoint_line_is_reported_rather_than_skipped(tmp_path):
+    """Being killed mid-write is normal; silently dropping a cell is not."""
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    path = tmp_path / "cells.jsonl"
+    path.write_text('{"task": "T", "seed": 0, "method_id": "still"\n')
+    sweep = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,),
+                  checkpoint=str(path))
+    with pytest.raises(ValueError, match="readable episode record"):
+        sweep.run(_cell_specs())
+
+
+def test_blank_checkpoint_lines_are_tolerated(tmp_path):
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    path = tmp_path / "cells.jsonl"
+    first = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,),
+                  checkpoint=str(path))
+    first.run(_cell_specs())
+    path.write_text("\n" + path.read_text() + "\n\n")
+    second = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,),
+                   checkpoint=str(path))
+    second.run(_cell_specs())
+    assert second.resumed == 1
