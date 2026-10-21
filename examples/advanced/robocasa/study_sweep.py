@@ -87,6 +87,10 @@ class Sweep:
     tasks: tuple = ("PickPlaceCounterToCabinet",)
     seeds: tuple = DEFAULT_SEEDS
     max_steps: int = 400
+    #: Action sources the envelope admits. Scripted only by default, so
+    #: admitting a model's output is a deliberate, recorded widening rather
+    #: than a method quietly mislabelling itself to get through.
+    allowed_sources: tuple = ("scripted",)
     results: list = field(default_factory=list)
 
     def run(self, methods) -> dict:
@@ -97,7 +101,8 @@ class Sweep:
             raise ValueError("a sweep needs at least one method")
         if len({spec.method_id for spec in specs}) != len(specs):
             raise ValueError("methods contain a duplicate method_id")
-        harness = MethodHarness(safety=SafetyEnvelope())
+        harness = MethodHarness(safety=SafetyEnvelope(
+            allowed_sources=frozenset(self.allowed_sources)))
         for task in self.tasks:
             for seed in self.seeds:
                 for spec in specs:
@@ -162,6 +167,7 @@ class Sweep:
         return {"schema_version": 1,
                 "protocol": {"tasks": list(self.tasks), "seeds": list(self.seeds),
                              "max_steps": self.max_steps,
+                             "allowed_sources": sorted(self.allowed_sources),
                              "episodes": len(self.tasks) * len(self.seeds)},
                 "episodes": [row.to_dict() for row in self.results],
                 "summary": summary,

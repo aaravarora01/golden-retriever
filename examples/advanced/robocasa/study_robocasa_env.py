@@ -64,13 +64,32 @@ from .study_progress import ProgressTracker
 from .study_representations import EefDeltaCodec, UnsupportedRepresentation
 
 #: RoboCasa camera names, mapped to the roles RoboLab's DROID registration uses.
+#: Roles that exist on *both* backends, so one observation config describes
+#: either. Keep this set equal to the RoboLab backend's — that equality is what
+#: the GPU port rests on, and it is asserted by a test.
 CAMERA_ROLES = {
     "over_shoulder": "robot0_agentview_left",
     "wrist": "robot0_eye_in_hand",
 }
+#: Roles this backend has and DROID does not. The released RoboCasa checkpoint
+#: was trained with both agentview cameras, so the right view has to be
+#: available — but DROID has no equivalent, so an observation config using it
+#: **does not port to RoboLab**, and that is why it is a separate dict rather
+#: than another entry above.
+BACKEND_ONLY_CAMERA_ROLES = {
+    "agentview_right": "robot0_agentview_right",
+}
+#: Every role this backend can render.
+ALL_CAMERA_ROLES = {**CAMERA_ROLES, **BACKEND_ONLY_CAMERA_ROLES}
 #: Representations this backend can express natively; see `study_representations`.
 SUPPORTED_REPRESENTATIONS = ("eef_delta", "eef_absolute", "eef_delta_base",
-                            "joint_delta")
+                            "joint_delta", "lerobot_12")
+#: Representations whose rows are already a full native action under a known
+#: permutation, so no codec converts them. See `study_vla` for the mapping and
+#: how it was derived.
+PASSTHROUGH_REPRESENTATIONS = ("lerobot_12",)
+#: Proprioception vectors a policy can be given.
+STATE_MODES = ("robolab", "lerobot")
 #: Representations that need the arm driven in joint space rather than
 #: operational space, which is a different composite controller.
 JOINT_REPRESENTATIONS = ("joint_delta",)
@@ -95,8 +114,9 @@ class ObservationConfig:
     image_size: int = 128
 
     def __post_init__(self) -> None:
-        if not self.views or any(view not in CAMERA_ROLES for view in self.views):
-            raise ValueError(f"views must be a non-empty subset of {tuple(CAMERA_ROLES)}")
+        if not self.views or any(view not in ALL_CAMERA_ROLES for view in self.views):
+            raise ValueError(
+                f"views must be a non-empty subset of {tuple(ALL_CAMERA_ROLES)}")
         if len(set(self.views)) != len(self.views):
             raise ValueError("views contains a duplicate")
         if type(self.history) is not int or not 0 <= self.history <= 8:
@@ -106,11 +126,16 @@ class ObservationConfig:
 
     @property
     def camera_names(self) -> list:
-        return [CAMERA_ROLES[view] for view in self.views]
+        return [ALL_CAMERA_ROLES[view] for view in self.views]
+
+    @property
+    def portable(self) -> bool:
+        """Whether every requested view also exists on the RoboLab backend."""
+        return all(view in CAMERA_ROLES for view in self.views)
 
     def to_dict(self) -> dict:
         return {"views": list(self.views), "history": self.history,
-                "image_size": self.image_size}
+                "image_size": self.image_size, "portable": self.portable}
 
 
 @dataclass
@@ -129,6 +154,10 @@ class RoboCasaPnPEnvironment:
     #: The study's task-specification axis: RoboCasa's own goal string, or the
     #: derived instruction that withholds the object's identity.
     specification_style: str = "default"
+    #: Which proprioception vector the policy receives. "robolab" mirrors the
+    #: DROID registration; "lerobot" is the 16-wide robosuite state the released
+    #: RoboCasa checkpoint was trained against.
+    state_mode: str = "robolab"
     env: object = None
     codec: EefDeltaCodec | None = None
     arm: object = None
@@ -142,6 +171,12 @@ class RoboCasaPnPEnvironment:
     def __post_init__(self) -> None:
         if self.representation in JOINT_REPRESENTATIONS and self.command_base:
             raise ValueError("a joint representation does not command the base")
+        if self.representation in PASSTHROUGH_REPRESENTATIONS and self.command_base:
+            # The row carries its own base segment and mode flag, so deriving
+            # the flag here would overwrite what the policy asked for.
+            raise ValueError("a passthrough representation carries its own base command")
+        if self.state_mode not in STATE_MODES:
+            raise ValueError(f"state_mode must be one of {STATE_MODES}")
         if self.representation not in SUPPORTED_REPRESENTATIONS:
             raise UnsupportedRepresentation(
                 f"the RoboCasa backend cannot express {self.representation!r}; "
@@ -186,6 +221,10 @@ class RoboCasaPnPEnvironment:
             from .study_ik import ArmModel
 
             self.arm, self.codec = ArmModel(env=self.env), None
+        elif self.representation in PASSTHROUGH_REPRESENTATIONS:
+            # Rows are already native under a permutation, so there is nothing
+            # for a codec to convert.
+            self.arm, self.codec = None, None
         else:
             self.arm, self.codec = None, EefDeltaCodec(self.representation)
         self.progress = ProgressTracker()
@@ -209,6 +248,8 @@ class RoboCasaPnPEnvironment:
     def step(self, action):
         if self.representation in JOINT_REPRESENTATIONS:
             return self._step_joints(action)
+        if self.representation in PASSTHROUGH_REPRESENTATIONS:
+            return self._step_passthrough(action)
         row = self.codec.to_delta(
             action,
             current_position=self._eef_position(),
@@ -230,6 +271,22 @@ class RoboCasaPnPEnvironment:
         self._track(raw)
         from .method_harness import Transition
 
+        return Transition(observation=self._observation(raw), reward=float(reward),
+                          terminated=bool(done) or self._last_success)
+
+    def _step_passthrough(self, action):
+        """Apply a 12-wide LeRobot row by permuting it into native order.
+
+        Nothing is rescaled: every dimension of the released checkpoint's action
+        is already bounded to one, which is also what the envelope enforces, so
+        the only transformation the row needs is the reordering.
+        """
+        from .method_harness import Transition
+        from .study_vla import to_native_action
+
+        full = to_native_action(action)
+        raw, reward, done, _ = self.env.step(full)
+        self._track(raw)
         return Transition(observation=self._observation(raw), reward=float(reward),
                           terminated=bool(done) or self._last_success)
 
@@ -286,6 +343,13 @@ class RoboCasaPnPEnvironment:
         )
 
     def _proprioception(self, raw) -> np.ndarray:
+        if self.state_mode == "lerobot":
+            from .study_vla import lerobot_state
+
+            return lerobot_state(raw)
+        return self._robolab_proprioception(raw)
+
+    def _robolab_proprioception(self, raw) -> np.ndarray:
         """Joint positions, gripper opening and end-effector pose.
 
         Mirrors RoboLab's DROID registration, which gives `arm_joint_pos` (7,)

@@ -18,7 +18,8 @@ import argparse
 from .study_methods import RandomMethod, StillMethod
 from .study_reference import ScriptedPickMethod
 from .study_sweep import MethodSpec, Sweep, render
-from .study_tasks import DEFAULT_SEEDS, ablation_subset, get_task, list_tasks
+from .study_tasks import (
+    DEFAULT_SEEDS, ablation_subset, get_task, list_tasks, vla_comparable)
 
 
 def baseline_specs(horizon: int, representation: str) -> tuple:
@@ -49,6 +50,30 @@ def reference_specs(horizon: int) -> tuple:
     )
 
 
+def vla_specs(horizon: int) -> tuple:
+    """A released RoboCasa VLA checkpoint, in its own representation.
+
+    Its observation and action spaces are fixed by the checkpoint — three views
+    at 256 px, a 16-wide state, a 12-wide action in its own ordering — so none
+    of them follow `--representation`.
+    """
+    from .study_vla import SmolVlaMethod
+
+    return (
+        MethodSpec(method_id="smolvla", horizon=horizon, representation="lerobot_12",
+                   label="lerobot/smolvla_robocasa; a trained policy, not privileged",
+                   build=lambda env, h=horizon: SmolVlaMethod(horizon=h)),
+    )
+
+
+def vla_observation():
+    from .study_robocasa_env import ObservationConfig
+    from .study_vla import LEROBOT_IMAGE_SIZE, LEROBOT_VIEWS
+
+    return ObservationConfig(views=LEROBOT_VIEWS, history=0,
+                             image_size=LEROBOT_IMAGE_SIZE)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="study-pnp")
     parser.add_argument("--task", action="append", dest="tasks", default=None,
@@ -67,7 +92,9 @@ def main(argv=None) -> int:
     parser.add_argument("--specification", choices=("default", "vague"), default="default",
                         help="Task-specification axis: RoboCasa's goal, or the derived "
                              "instruction that withholds the object's identity.")
-    parser.add_argument("--methods", choices=("baselines", "reference", "both"),
+    parser.add_argument("--vla-tasks", action="store_true",
+                        help="Run only the tasks the released VLA checkpoint also knows.")
+    parser.add_argument("--methods", choices=("baselines", "reference", "vla", "both"),
                         default="baselines",
                         help="Which arms to run. The reference is privileged and always "
                              "uses joint_delta, whatever --representation says.")
@@ -77,6 +104,12 @@ def main(argv=None) -> int:
     from .study_robocasa_env import RoboCasaPnPEnvironment
 
     def build(task, representation):
+        if representation == "lerobot_12":
+            # The checkpoint fixes its own observation and state format.
+            return RoboCasaPnPEnvironment(
+                task=task, representation=representation,
+                observation=vla_observation(), state_mode="lerobot",
+                specification_style=args.specification)
         return RoboCasaPnPEnvironment(
             task=task, representation=representation,
             command_base=representation == "eef_delta_base",
@@ -85,6 +118,8 @@ def main(argv=None) -> int:
     try:
         if args.tasks:
             tasks = tuple(get_task(name).task for name in args.tasks)
+        elif args.vla_tasks:
+            tasks = vla_comparable()
         elif args.all_tasks:
             tasks = list_tasks()
         else:
@@ -94,8 +129,14 @@ def main(argv=None) -> int:
             specs += baseline_specs(args.horizon, args.representation)
         if args.methods in ("reference", "both"):
             specs += reference_specs(args.horizon)
+        if args.methods == "vla":
+            specs += vla_specs(args.horizon)
+        # A model's output is admitted only when a model arm is actually in
+        # the sweep, so the default stays scripted-only.
+        sources = ("scripted", "model") if args.methods == "vla" else ("scripted",)
         sweep = Sweep(build_environment=build, tasks=tasks,
-                      seeds=tuple(args.seeds), max_steps=args.max_steps)
+                      seeds=tuple(args.seeds), max_steps=args.max_steps,
+                      allowed_sources=sources)
         summary = sweep.run(specs)
     except (ValueError, TypeError, OSError) as error:
         print(render({"error": f"{type(error).__name__}: {error}"}))

@@ -153,6 +153,28 @@ def list_tasks() -> tuple:
     return tuple(sorted(_BY_NAME))
 
 
+#: Tasks that are both in this study's committed suite and in the training set
+#: of `lerobot/smolvla_robocasa`, so a released policy can be read against our
+#: own methods on identical tasks. Five of eighteen; the rest are listed in
+#: STUDY.md with what each would need.
+VLA_COMPARABLE_TASKS = (
+    "PickPlaceCounterToCabinet",
+    "PickPlaceCounterToStove",
+    "PickPlaceDrawerToCounter",
+    "PickPlaceSinkToCounter",
+    "PickPlaceToasterToCounter",
+)
+
+
+def vla_comparable() -> tuple:
+    """The committed tasks a released RoboCasa checkpoint also knows."""
+    known = set(list_tasks())
+    missing = [task for task in VLA_COMPARABLE_TASKS if task not in known]
+    if missing:
+        raise ValueError(f"not committed tasks: {missing}")
+    return VLA_COMPARABLE_TASKS
+
+
 def ablation_subset(count: int = 8) -> tuple:
     """A spread across the reach range, for sweeps too slow to run all 18.
 

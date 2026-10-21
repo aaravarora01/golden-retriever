@@ -197,6 +197,11 @@ rerun-sdk = "==0.22.1"
 fastapi = ">=0.116,<1"
 uvicorn = { version = ">=0.35,<1", extras = ["standard"] }
 google-genai = "==1.72.0"
+# SmolVLA's backbone. lerobot and torch already arrive with robocasa; these are
+# the three it needs on top to load a released checkpoint.
+transformers = ">=4.52,<5"
+accelerate = ">=1.7"
+num2words = ">=0.5.14"
 
 [feature.robocasa.pypi-options.dependency-overrides]
 mujoco = "==3.3.1"
@@ -207,6 +212,7 @@ study-pnp-baselines = { cmd = "python -m examples.advanced.robocasa.study_app --
 study-pnp-sweep = { cmd = "python -m examples.advanced.robocasa.study_app", env = { PYTHONPATH = "." } }
 study-pnp-vague = { cmd = "python -m examples.advanced.robocasa.study_app --specification vague --summary-only", env = { PYTHONPATH = "." } }
 study-pnp-reference = { cmd = "python -m examples.advanced.robocasa.study_app --methods reference --horizon 1 --max-steps 2200 --subset 2 --seeds 0", env = { PYTHONPATH = "." } }
+study-pnp-vla = { cmd = "python -m examples.advanced.robocasa.study_app --methods vla --horizon 1 --max-steps 1200 --vla-tasks --seeds 0", env = { PYTHONPATH = "." } }
 test-robocasa-study = { cmd = "python -m pytest -q tests/examples/test_robocasa_study.py", env = { PYTHONPATH = "." } }
 test-robocasa-study-ik = { cmd = "python -m pytest -q tests/examples/test_robocasa_study_ik.py", env = { PYTHONPATH = "." } }
 test-robocasa-launcher = { cmd = "python -m pytest -q tests/examples/test_robocasa_launcher.py", env = { PYTHONPATH = "." } }

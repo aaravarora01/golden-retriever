@@ -41,6 +41,9 @@ REPRESENTATIONS = (
     "joint_position", # (q0..q6, gripper)
     "eef_delta_base", # (dx, dy, dz, drx, dry, drz, gripper, base_x, base_y, base_yaw)
     "joint_delta",    # (dq0..dq6, gripper), each normalised to [-1, 1]
+    # A released checkpoint's own ordering: base(3), torso, mode, eef_pos(3),
+    # eef_rot(3), gripper. Native under a permutation; see `study_vla`.
+    "lerobot_12",
 )
 
 #: Width of one action row per representation, gripper command included.
@@ -51,6 +54,7 @@ REPRESENTATION_DOF = {
     "joint_position": 8,
     "eef_delta_base": 10,
     "joint_delta": 8,
+    "lerobot_12": 12,
 }
 
 

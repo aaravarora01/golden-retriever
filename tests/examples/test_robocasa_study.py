@@ -1635,3 +1635,208 @@ def test_a_calibrated_forward_model_advances_less_than_a_naive_one():
     assert _travel(8, 0.265) == pytest.approx(_travel(8, 1.0))
     for horizon in (10, 16, 32):
         assert _travel(horizon, 0.265) < _travel(horizon, 1.0)
+
+
+# --- the released VLA policy ---------------------------------------------
+#
+# The mapping between the checkpoint's action ordering and this robot's is the
+# one place where a mistake would look like success: both are 12 wide, so an
+# unpermuted row steps the simulator happily while commanding the base with
+# end-effector deltas. These pin it against the environment's own slices.
+
+
+def test_the_lerobot_permutation_is_the_documented_one():
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, to_native_action
+
+    row = np.arange(LEROBOT_ACTION_DOF, dtype=np.float32)
+    assert to_native_action(row).tolist() == [5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4]
+
+
+def test_each_lerobot_segment_lands_in_the_environment_slice_that_owns_it():
+    """Cross-checked against the backend's constants, not restated from them."""
+    from examples.advanced.robocasa.study_robocasa_env import _ARM, _BASE, _GRIPPER
+    from examples.advanced.robocasa.study_vla import to_native_action
+
+    row = np.zeros(12, dtype=np.float32)
+    row[0:3] = [0.1, 0.2, 0.3]        # base x, y, yaw
+    row[3] = 0.0                      # torso, frozen in the training data
+    row[4] = 1.0                      # base_mode
+    row[5:8] = [0.4, 0.5, 0.6]        # eef position
+    row[8:11] = [0.7, 0.8, 0.9]       # eef rotation
+    row[11] = -1.0                    # gripper
+    native = to_native_action(row)
+    assert native[_ARM].tolist() == pytest.approx([0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    assert native[_GRIPPER].tolist() == pytest.approx([-1.0])
+    assert native[_BASE].tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert native[10] == pytest.approx(0.0)   # torso
+    assert native[11] == pytest.approx(1.0)   # base_mode
+
+
+def test_the_permutation_is_a_permutation():
+    """Nothing is dropped or duplicated, which a hand-written mapping can do."""
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, NATIVE_FROM_LEROBOT
+
+    assert sorted(NATIVE_FROM_LEROBOT) == list(range(LEROBOT_ACTION_DOF))
+
+
+@pytest.mark.parametrize("row", [np.zeros(7), np.zeros(13), np.zeros((2, 12))])
+def test_a_misshaped_lerobot_row_is_rejected(row):
+    from examples.advanced.robocasa.study_vla import to_native_action
+
+    with pytest.raises(ValueError, match="12 wide"):
+        to_native_action(row)
+
+
+def test_a_non_finite_lerobot_row_is_rejected():
+    from examples.advanced.robocasa.study_vla import to_native_action
+
+    row = np.zeros(12)
+    row[4] = np.inf
+    with pytest.raises(ValueError, match="non-finite"):
+        to_native_action(row)
+
+
+def _raw_state(**overrides):
+    raw = {"robot0_base_pos": np.array([1.0, 2.0, 0.7]),
+           "robot0_base_quat": np.array([0.0, 0.0, 0.3, 0.95]),
+           "robot0_eef_pos": np.array([0.4, -0.3, 1.0]),
+           "robot0_eef_quat": np.array([0.1, 0.2, 0.3, 0.9]),
+           "robot0_gripper_qpos": np.array([0.03, -0.03])}
+    raw.update(overrides)
+    return raw
+
+
+def test_the_lerobot_state_is_sixteen_wide_in_the_documented_order():
+    from examples.advanced.robocasa.study_vla import LEROBOT_STATE_DOF, lerobot_state
+
+    state = lerobot_state(_raw_state())
+    assert state.shape == (LEROBOT_STATE_DOF,)
+    assert state.tolist() == pytest.approx(
+        [1.0, 2.0, 0.7, 0.0, 0.0, 0.3, 0.95, 0.4, -0.3, 1.0, 0.1, 0.2, 0.3, 0.9, 0.03, -0.03])
+
+
+def test_a_missing_state_observable_is_named():
+    from examples.advanced.robocasa.study_vla import lerobot_state
+
+    raw = _raw_state()
+    del raw["robot0_eef_quat"]
+    with pytest.raises(KeyError, match="robot0_eef_quat"):
+        lerobot_state(raw)
+
+
+def test_a_state_that_assembles_to_the_wrong_width_is_rejected():
+    from examples.advanced.robocasa.study_vla import lerobot_state
+
+    with pytest.raises(ValueError, match="expected"):
+        lerobot_state(_raw_state(robot0_gripper_qpos=np.array([0.03])))
+
+
+def test_untiling_inverts_the_observation_tiling_exactly():
+    """The policy wants three views; the contract carries one tiled image."""
+    from examples.advanced.robocasa.study_observation import tile_frames
+    from examples.advanced.robocasa.study_vla import untile
+
+    views = [np.full((64, 64, 3), fill, dtype=np.uint8) for fill in (10, 20, 30)]
+    recovered = untile(tile_frames([views]), views=3)
+    assert len(recovered) == 3
+    for original, back in zip(views, recovered):
+        assert np.array_equal(original, back)
+
+
+@pytest.mark.parametrize("image,match", [
+    (np.zeros((64, 100, 3), dtype=np.uint8), "does not divide"),
+    (np.zeros((64, 64, 3), dtype=np.uint8), "does not divide"),
+    (np.zeros((64, 195, 3), dtype=np.uint8), "must be square"),
+    (np.zeros((64, 64), dtype=np.uint8), r"\(H, W, 3\)"),
+])
+def test_an_untileable_image_is_rejected(image, match):
+    from examples.advanced.robocasa.study_vla import untile
+
+    with pytest.raises(ValueError, match=match):
+        untile(image, views=3)
+
+
+def test_the_vla_declares_itself_a_model_and_not_privileged():
+    """It sees only images, state and the instruction - no simulator reads."""
+    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+
+    described = SmolVlaMethod().describe()
+    assert described["source"] == "model"
+    assert described["privileged"] is False
+    assert described["checkpoint"] == "lerobot/smolvla_robocasa"
+
+
+@pytest.mark.parametrize("horizon", [0, 51, 1.0])
+def test_the_vla_rejects_an_unusable_horizon(horizon):
+    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+
+    with pytest.raises(ValueError, match="horizon"):
+        SmolVlaMethod(horizon=horizon)
+
+
+def test_the_vla_rejects_an_empty_checkpoint():
+    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        SmolVlaMethod(checkpoint="  ")
+
+
+def test_a_model_source_needs_the_envelope_widened_deliberately():
+    """The default allowlist is scripted-only, and that is load-bearing.
+
+    The existing model methods declare "scripted" to get through it, which
+    mislabels them; this method declares the truth, so a sweep running it has
+    to say so in its protocol block.
+    """
+    from examples.advanced.openpi_policy.common import ActionChunk
+    from examples.advanced.robocasa.method_harness import SafetyEnvelope
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    assert Sweep(build_environment=lambda *a, **k: None).allowed_sources == ("scripted",)
+    chunk = ActionChunk(actions=np.zeros((1, 12), dtype=np.float32), horizon=1,
+                        dof=12, source="model")
+    with pytest.raises(ValueError):
+        SafetyEnvelope().validate(chunk)
+    SafetyEnvelope(allowed_sources=frozenset({"model"})).validate(chunk)
+
+
+def test_the_lerobot_representation_is_registered_at_twelve_wide():
+    from examples.advanced.robocasa.study_representations import (
+        REPRESENTATION_DOF, REPRESENTATIONS)
+
+    assert "lerobot_12" in REPRESENTATIONS
+    assert REPRESENTATION_DOF["lerobot_12"] == 12
+
+
+def test_a_passthrough_representation_does_not_derive_the_base_mode():
+    """The row carries its own mode flag; deriving one would overwrite it."""
+    from examples.advanced.robocasa.study_robocasa_env import RoboCasaPnPEnvironment
+
+    with pytest.raises(ValueError, match="carries its own base command"):
+        RoboCasaPnPEnvironment(representation="lerobot_12", command_base=True)
+
+
+def test_an_unknown_state_mode_is_rejected():
+    from examples.advanced.robocasa.study_robocasa_env import RoboCasaPnPEnvironment
+
+    with pytest.raises(ValueError, match="state_mode"):
+        RoboCasaPnPEnvironment(state_mode="whatever")
+
+
+def test_the_third_agentview_is_a_declared_role():
+    """The checkpoint was trained with both agentview cameras plus the wrist."""
+    from examples.advanced.robocasa.study_robocasa_env import CAMERA_ROLES
+    from examples.advanced.robocasa.study_vla import LEROBOT_VIEWS
+
+    from examples.advanced.robocasa.study_robocasa_env import (
+        ALL_CAMERA_ROLES, ObservationConfig)
+
+    for view in LEROBOT_VIEWS:
+        assert view in ALL_CAMERA_ROLES
+    assert [ALL_CAMERA_ROLES[v] for v in LEROBOT_VIEWS] == [
+        "robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"]
+    # The third view is RoboCasa-only, so it must not widen the portable set
+    # that the RoboLab backend is held equal to.
+    assert "agentview_right" not in CAMERA_ROLES
+    assert ObservationConfig(views=LEROBOT_VIEWS, image_size=256).portable is False
+    assert ObservationConfig(views=("over_shoulder", "wrist")).portable is True
