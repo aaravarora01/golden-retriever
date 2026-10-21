@@ -212,7 +212,7 @@ study-pnp-baselines = { cmd = "python -m examples.advanced.robocasa.study_app --
 study-pnp-sweep = { cmd = "python -m examples.advanced.robocasa.study_app", env = { PYTHONPATH = "." } }
 study-pnp-vague = { cmd = "python -m examples.advanced.robocasa.study_app --specification vague --summary-only", env = { PYTHONPATH = "." } }
 study-pnp-reference = { cmd = "python -m examples.advanced.robocasa.study_app --methods reference --horizon 1 --max-steps 2200 --subset 2 --seeds 0", env = { PYTHONPATH = "." } }
-study-pnp-vla = { cmd = "python -m examples.advanced.robocasa.study_app --methods vla --horizon 1 --max-steps 1200 --vla-tasks --seeds 0", env = { PYTHONPATH = "." } }
+study-pnp-vla = { cmd = "python -m examples.advanced.robocasa.study_app --methods vla --horizon 1 --max-steps 1200 --vla-tasks --seeds 0 1 2 3 4 --checkpoint out/vla_cells.jsonl", env = { PYTHONPATH = ".", KMP_DUPLICATE_LIB_OK = "TRUE" } }
 test-robocasa-study = { cmd = "python -m pytest -q tests/examples/test_robocasa_study.py", env = { PYTHONPATH = "." } }
 test-robocasa-study-ik = { cmd = "python -m pytest -q tests/examples/test_robocasa_study_ik.py", env = { PYTHONPATH = "." } }
 test-robocasa-launcher = { cmd = "python -m pytest -q tests/examples/test_robocasa_launcher.py", env = { PYTHONPATH = "." } }
