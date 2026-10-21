@@ -304,14 +304,78 @@ first attempt.
 over the top — nudging it 5 mm without gripping. The working band measured 0.6
 to 1.2 cm; 1.8 cm only brushes it and 0 cm has no clear solution.
 
-**What is left is transport and release**, and the harness integration: the
-study's RoboCasa backend exposes `eef_delta`, while this pipeline drives joint
-targets, so a `joint_position` representation is needed before a scripted
-reference can run through the sweep and put a non-zero Score in the results
-table. A second solve-and-follow descends
-to about 3 cm of the object and the fingers do not close on it. Follow parameters are less forgiving than they look: tightening `tolerance` from
+Follow parameters are less forgiving than they look: tightening `tolerance` from
 0.05 to 0.04 made a stage stall against its tick budget instead of tracking more
 accurately, so the committed defaults are the measured ones.
+
+**The pick now runs through the harness, not beside it.** `study_reference`
+wraps the pipeline above as a `MethodAdapter`, so it faces the same
+`SafetyEnvelope`, the same normalised action bound and the same
+one-row-per-control-step dispatch a model policy gets. That bound fixes the
+representation: the envelope caps every element at 1.0 while a joint target is
+in radians up to about 3, so `joint_delta` is a normalised step on a declared
+scale, relative to the live posture, which the environment turns into the
+absolute targets a `JOINT_POSITION` controller wants. A joint representation
+selects that controller explicitly — the default composite drives operational
+space and would read the row as a pose. The reference reports
+`privileged: True`, because it reads the object's pose from the simulator and no
+policy in the study may.
+
+Two measured facts shaped it. **Reaching the end of a path leg is not arriving
+at it**: the command leads the arm by up to the follow tolerance, and advancing
+the moment the leg's index ran out left the hand 2.5 cm above the object and
+closed the fingers on each other — four contacts, both finger pads, no object
+between them. Each leg now holds its target for a settle window, exactly as
+`follow_path` does. And **clear postures thin out near the object**, so each
+phase gets the retry budget `reach` has, with every failure recorded: a phase
+that silently does not happen is indistinguishable from one that happened badly,
+and the lift was skipping entirely before the reason was written down.
+
+**What is left is transport and release.** The task's own predicate is
+pick-and-*place* into the cabinet, so the fourth rung needs the object carried
+and let go, which nothing does yet.
+
+## The action-horizon axis, measured
+
+The first axis a working reference makes measurable, and it turns out to be an
+*interaction* with the representation axis rather than an effect of its own.
+
+`predict` builds every row of a chunk before any of them is dispatched, so at
+horizon n the progress gate sees the world once per n control steps. Against an
+integrating representation that compounds: a horizon-1 chunk commands 0.050 rad
+and a horizon-15 chunk commands 0.750 rad, and an arm thrown that far never
+lands within the gate's tolerance again — the path stalls at 0.06 of its first
+leg. An absolute representation would not compound this way.
+
+The obvious fix is a forward model, and the useful finding is that it does not
+simply work. Scores on `PickPlaceCounterToCabinet`, seed 0, 4000 control steps:
+
+| horizon | model calls | stale gate | forward model, gain 1.0 | forward model, gain 0.265 |
+| --- | --- | --- | --- | --- |
+| 1 | 4000 | **75** | 75 | 75 |
+| 5 | 800 | **75** | 50, 6 plan failures | 50 |
+| 15 | 267 | 0 | 50, 6 plan failures | **50** |
+| 32 | 125 | 0 | 25, 7 plan failures | **50** |
+
+A gain of 1.0 assumes a row lands where it was aimed. It does not: holding a
+full-scale row delivers 0.148 of the commanded step on the first tick and 0.265
+in steady state, so the naive prediction overshoots roughly fourfold and the
+gate advances on arrivals that have not happened — the mirror image of the stale
+failure, and it costs the short horizons outright. Calibrating the gain to the
+measured 0.265 removes every plan failure and holds a flat 50 out to horizon 32,
+but does not recover the lift that the stale gate gets at horizon 5.
+
+So no setting dominates, and the honest reading is that both ways of guessing
+inside an open-loop chunk are wrong — the gate wants the truth, and inside the
+chunk the truth is not available. `dead_reckon` defaults **off**, which wins at
+the horizons in the study's short band, and stays a flag because reproducing
+both halves of the interaction is the point.
+
+The cost side is the part that transfers. Horizon 5 scores exactly what horizon
+1 does for a **fifth** of the model calls — 800 against 4000 — at the same
+control-step count. Chunking is close to free up to the point where the
+open-loop assumption breaks, and that break point is a property of the
+representation, not of the horizon.
 
 The superseded diagnosis follows, kept because it was the working hypothesis for
 several of the measurements above. With the planned path followed waypoint by waypoint,
@@ -324,13 +388,13 @@ correction saturates, so the path's collision-avoidance is not actually being
 honoured. Driving an arm to arbitrary joint configurations under gravitational
 load needs either a controller with gravity compensation, or a time-parameterised
 trajectory rather than a sequence of setpoints. That is the next thing to try,
-and it is a controls problem rather than a planning or kinematics one. Three facts about commanding this arm
-are recorded in `study_ik` because none is in any documentation: the arm takes
-absolute joint targets only once the body-part controller is reconfigured to
-`JOINT_POSITION`, which widens the action vector to 13; `output_max` clips the
-absolute target, so it must span the joint ranges or a commanded posture is
-silently truncated; and the controller droops under gravitational load, which
-integral correction fixes wherever the path is clear.
+and it is a controls problem rather than a planning or kinematics one.
+
+Of the three undocumented facts that version recorded, only the first survived
+isolation: the arm takes absolute joint targets once the body-part controller is
+reconfigured to `JOINT_POSITION`. The other two are **wrong** and are corrected
+above — `output_max` does not clip an absolute target, and the controller does
+not droop, because gravity compensation was on the whole time.
 
 **Demonstration replay is blocked upstream.** The obvious way to get a reference
 without writing a controller is to replay RoboCasa's human demonstrations. The

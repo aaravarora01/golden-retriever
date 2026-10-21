@@ -1550,3 +1550,88 @@ def test_the_reference_records_why_a_plan_failed():
     method._target_for = lambda phase: None  # type: ignore[method-assign]
     assert method._plan_for("lift") is False
     assert method.failures[0]["reason"] == "no target"
+
+
+def test_the_reference_builds_a_chunk_against_one_posture_by_default():
+    """The measured interaction behind the horizon axis.
+
+    Rows are built before any is dispatched, so without a forward model every
+    row in a chunk sees the posture the chunk began at. Against an integrating
+    representation that compounds: measured, horizon 15 commands 0.750 rad per
+    chunk against horizon 1's 0.050, and the score goes from 75 to 0.
+    """
+    method = _reference(horizon=4)
+    method._path, method._leg, method._travelled = [np.zeros(7), np.full(7, 1.0)], 1, 0.0
+    rows = method.predict(_observation()).actions
+    assert method._predicted is None
+    # The gate advances a few increments, then stalls and repeats, because the
+    # arm it is gating on never appears to move.
+    assert np.allclose(rows[-1], rows[-2])
+
+
+def test_the_reference_can_predict_its_own_posture_forward():
+    """Dead reckoning lets one chunk walk the path instead of stalling on it.
+
+    The difference is the whole interaction: a chunk gated on a posture that
+    never appears to move advances one increment and then repeats itself, while
+    one gated on its own predictions advances every row. Which of those is
+    better depends on the horizon, and neither is right - see the module
+    docstring for what each costs.
+    """
+    from examples.advanced.robocasa.study_reference import FOLLOW_INCREMENT
+
+    stale, predicting = _reference(horizon=4), _reference(horizon=4, dead_reckon=True)
+    for method in (stale, predicting):
+        method._path, method._leg, method._travelled = [np.zeros(7), np.full(7, 1.0)], 1, 0.0
+        method.predict(_observation())
+    assert stale._predicted is None
+    assert predicting._predicted is not None
+    assert predicting._travelled == pytest.approx(4 * FOLLOW_INCREMENT)
+    assert predicting._travelled > stale._travelled
+
+
+def test_dead_reckoning_is_reported_in_the_description():
+    """It changes the policy's behaviour, so a run has to record which it was."""
+    assert _reference().describe()["dead_reckon"] is False
+    assert _reference(dead_reckon=True).describe()["dead_reckon"] is True
+
+
+@pytest.mark.parametrize("gain", [0.0, -0.5, 1.5, 1])
+def test_an_unusable_tracking_gain_is_rejected(gain):
+    from examples.advanced.robocasa.study_reference import ScriptedPickMethod
+
+    with pytest.raises(ValueError, match="tracking"):
+        ScriptedPickMethod(environment=_StubbedWorld(), tracking=gain)
+
+
+def test_the_forward_model_gain_is_the_measured_one():
+    """A gain of 1.0 assumes a row lands where it was aimed, which it does not.
+
+    Holding a full-scale row delivers 0.148 of the commanded step on the first
+    tick and 0.265 in steady state, so the naive model overshoots fourfold and
+    the gate advances on arrivals that have not happened.
+    """
+    from examples.advanced.robocasa.study_reference import TRACKING_FRACTION
+
+    assert 0.0 < TRACKING_FRACTION < 1.0
+    assert _reference().tracking == TRACKING_FRACTION
+
+
+def _travel(horizon, gain):
+    """How far down a leg one chunk advances the command."""
+    method = _reference(horizon=horizon, dead_reckon=True, tracking=gain)
+    method._path, method._leg, method._travelled = [np.zeros(7), np.full(7, 1.0)], 1, 0.0
+    method.predict(_observation())
+    return method._travelled
+
+
+def test_a_calibrated_forward_model_advances_less_than_a_naive_one():
+    """The gain is what separates an optimistic gate from a truthful one.
+
+    It only bites once the predicted lead has opened past the gate's tolerance,
+    which takes about ten rows here - so a short chunk is unaffected and a long
+    one is held back, which is the shape of the measured scores.
+    """
+    assert _travel(8, 0.265) == pytest.approx(_travel(8, 1.0))
+    for horizon in (10, 16, 32):
+        assert _travel(horizon, 0.265) < _travel(horizon, 1.0)

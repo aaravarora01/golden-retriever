@@ -17,14 +17,35 @@ absolute target would be rejected outright. `joint_delta` is a normalised step o
 the declared `JOINT_DELTA_SCALE`, which keeps the policy inside the same bound
 every other method is held to.
 
-**Why horizon 1 by default.** The approach needs the commanded point held near
-the arm — that gating is what makes executed motion follow a collision-checked
-path, and getting it wrong was the single hardest bug in this lane. The harness
-dispatches a whole chunk before calling `predict` again, so a horizon of n means
-the gate is only consulted every n control steps. At 1 the method sees every
-step. A longer horizon is allowed and is expected to track worse, which makes
-the study's action-horizon axis measurable on a policy that actually works
-rather than on two that score zero.
+**Horizon, and the one interaction worth knowing about.** The approach needs the
+commanded point held near the arm — that gating is what makes executed motion
+follow a collision-checked path. The harness dispatches a whole chunk before
+calling `predict` again, so at horizon n the gate sees the world once per n
+control steps, and every row in a chunk is built before any of them is
+dispatched.
+
+Against an *integrating* representation that compounds. `joint_delta` is a step
+from wherever the arm is now, so a chunk built against one posture commands n
+of those steps: measured, horizon 1 commands 0.050 rad per chunk and horizon 15
+commands 0.750 rad, and the arm thrown that far never lands within the gate's
+tolerance again — the path stalls at 0.06 of its first leg and the score goes
+from 75 to 0. That is an *action-representation × action-horizon* interaction,
+not a horizon limit: an absolute representation would not compound this way.
+
+The obvious fix does not work, and that is the more useful finding. `dead_reckon`
+builds each row after the first against the posture the method's own earlier rows
+commanded, rather than the stale measured one. It trades one failure for its
+mirror image: horizon 15 recovers from 0 to 50, and horizon 5 *regresses* from 75
+to 50 with six plan failures. The reason is that the forward model is optimistic
+— it assumes a row lands where it was aimed, when a single control step delivers
+only a fraction of a commanded joint step, so the predicted posture runs ahead of
+the real arm and the gate advances on an arrival that has not happened. Stale and
+optimistic are both wrong; the gate wants the truth, and inside an open-loop
+chunk the truth is not available.
+
+So it defaults off, which is what measured best at the horizons that work, and
+stays a flag because reproducing both halves of that interaction is the point.
+Closing it properly needs a calibrated forward model rather than an assumed one.
 """
 
 from __future__ import annotations
@@ -50,6 +71,11 @@ GRASP_HEIGHT = 0.012
 LIFT_HEIGHT = 0.16
 #: Control steps spent closing the gripper before trusting the grasp.
 CLOSE_STEPS = 260
+#: Fraction of a commanded joint step one control step actually delivers.
+#: Measured by holding a full-scale row: 0.148 on the first step, settling to
+#: 0.265. The forward model needs this - assuming 1.0 overshoots fourfold, and
+#: that overshoot is what made naive dead reckoning cost the short horizons.
+TRACKING_FRACTION = 0.265
 #: Solve/plan attempts per phase. A retry re-solves from the arm's current
 #: posture with a new seed, which is what makes it a different attempt rather
 #: than a repeat; the lift in particular needs it, because clear postures get
@@ -76,6 +102,14 @@ class ScriptedPickMethod:
     source: str = "scripted"
     grasp_height: float = GRASP_HEIGHT
     lift_height: float = LIFT_HEIGHT
+    #: Predict the posture forward within a chunk instead of reusing the
+    #: measured one. Off by default: it rescues long horizons and costs short
+    #: ones, for the reason in the module docstring.
+    dead_reckon: bool = False
+    #: Gain on the forward model. The measured default makes a prediction match
+    #: what the controller delivers; 1.0 is the naive model that assumes a row
+    #: lands where it was aimed.
+    tracking: float = TRACKING_FRACTION
     phase: str = "approach"
     calls: int = 0
     closed_for: int = 0
@@ -86,11 +120,14 @@ class ScriptedPickMethod:
     _leg: int = 0
     _travelled: float = 0.0
     _settling: int = 0
+    _predicted: object = None
     _start_height: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.horizon) is not int or not 1 <= self.horizon <= 32:
             raise ValueError("horizon must be an int from 1 through 32")
+        if type(self.tracking) is not float or not 0.0 < self.tracking <= 1.0:
+            raise ValueError("tracking must be a float in (0, 1]")
         for name in ("grasp_height", "lift_height"):
             value = getattr(self, name)
             if type(value) is not float or not 0.0 < value <= 1.0:
@@ -200,10 +237,20 @@ class ScriptedPickMethod:
             return target
         direction = (target - start) / span
         here = start + direction * self._travelled
-        if float(np.linalg.norm(self.arm.joints() - here)) < FOLLOW_TOLERANCE:
+        if float(np.linalg.norm(self._posture() - here)) < FOLLOW_TOLERANCE:
             self._travelled = min(span, self._travelled + FOLLOW_INCREMENT)
             here = start + direction * self._travelled
         return here
+
+    def _posture(self):
+        """The posture to plan the next row against.
+
+        Mid-chunk this is where the method's own earlier rows have commanded the
+        arm to, not where the arm was measured when the chunk began.
+        """
+        if self._predicted is not None:
+            return self._predicted
+        return self.arm.joints()
 
     def _advance(self) -> None:
         """Move to the next phase, planning for it when it needs motion."""
@@ -224,6 +271,9 @@ class ScriptedPickMethod:
         if not self._path and self.phase == "approach":
             if not self._plan_for("approach"):
                 self._advance()
+        # A chunk starts from what the arm actually did; only rows within it are
+        # predicted forward.
+        self._predicted = self.arm.joints().copy() if self.dead_reckon else None
         rows = []
         for _ in range(self.horizon):
             rows.append(self._row())
@@ -250,10 +300,16 @@ class ScriptedPickMethod:
         # Normalise the remaining joint motion by the declared scale, so one
         # action commands at most one scale-step and stays inside the bound the
         # envelope enforces on every method.
-        delta = (point - self.arm.joints()) / JOINT_DELTA_SCALE
-        return np.concatenate([np.clip(delta, -1.0, 1.0), [grip]])
+        posture = self._posture()
+        delta = np.clip((point - posture) / JOINT_DELTA_SCALE, -1.0, 1.0)
+        if self._predicted is not None:
+            # Where this row actually lands, not where it is aimed: the
+            # controller delivers a fraction of a commanded step per tick.
+            self._predicted = posture + delta * JOINT_DELTA_SCALE * self.tracking
+        return np.concatenate([delta, [grip]])
 
     def describe(self) -> dict:
         return {"method": "scripted_pick", "privileged": True, "horizon": self.horizon,
+                "dead_reckon": self.dead_reckon, "tracking": self.tracking,
                 "grasp_height_m": self.grasp_height, "lift_height_m": self.lift_height,
                 "phase": self.phase, "calls": self.calls}
