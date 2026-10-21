@@ -86,6 +86,15 @@ LEROBOT_STATE_DOF = 16
 LEROBOT_ACTION_DOF = 12
 #: Native image side the checkpoint's config declares.
 LEROBOT_IMAGE_SIZE = 256
+#: Whether to flip rendered frames vertically before the policy sees them.
+#:
+#: Robosuite's `IMAGE_CONVENTION` defaults to `opengl`, which returns frames
+#: bottom-up; the dataset was converted under the opencv convention. Settled
+#: against a decoded training frame rather than assumed: that frame's
+#: bottom quarter is brighter than its top (138.1 against 86.1) while ours is
+#: the reverse (73.6 against 116.8), and the row-brightness profile correlates
+#: -0.120 as rendered against +0.570 flipped.
+FLIP_IMAGES = True
 
 #: Where each native action element comes from in a LeRobot row.
 #:
@@ -291,6 +300,8 @@ class SmolVlaMethod:
     horizon: int = 1
     source: str = "model"
     device: str = "cpu"
+    #: Flip frames to the convention the checkpoint was trained under.
+    flip_images: bool = FLIP_IMAGES
     policy: object = None
     calls: int = 0
     inferences: int = 0
@@ -383,6 +394,8 @@ class SmolVlaMethod:
         import torch
 
         views = untile(observation.image)
+        if self.flip_images:
+            views = [np.ascontiguousarray(view[::-1]) for view in views]
         state = np.asarray(observation.state, dtype=np.float32)
         if state.shape != (LEROBOT_STATE_DOF,):
             raise ValueError(f"the policy needs a {LEROBOT_STATE_DOF}-wide state, "
@@ -400,6 +413,7 @@ class SmolVlaMethod:
         return {"method": "smolvla", "checkpoint": self.checkpoint,
                 "training_dataset": TRAINING_DATASET, "privileged": False,
                 "horizon": self.horizon, "device": self.device,
+                "flip_images": self.flip_images,
                 "source": self.source, "calls": self.calls,
                 "inferences": self.inferences,
                 "frozen_commands": self.frozen_commands,

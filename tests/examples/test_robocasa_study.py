@@ -1882,3 +1882,50 @@ def test_the_third_agentview_is_a_declared_role():
     assert "agentview_right" not in CAMERA_ROLES
     assert ObservationConfig(views=LEROBOT_VIEWS, image_size=256).portable is False
     assert ObservationConfig(views=("over_shoulder", "wrist")).portable is True
+
+
+def test_the_identifier_specification_is_the_task_name():
+    """A released checkpoint's language conditioning need not be a sentence.
+
+    The RoboCasa LeRobot dataset stores its `tasks` field as the environment
+    name, so a policy trained on it is conditioned on the identifier. Measured:
+    the identifier reaches the object and the goal sentence does not.
+    """
+    from examples.advanced.robocasa.study_tasks import specification
+
+    spec = specification("PickPlaceCounterToCabinet", "identifier")
+    assert spec["text"] == "PickPlaceCounterToCabinet"
+    assert spec["style"] == "identifier"
+    assert spec["derived"] is False
+    assert spec["names_object"] is False
+
+
+def test_every_committed_task_has_an_identifier_specification():
+    from examples.advanced.robocasa.study_tasks import list_tasks, specification
+
+    for task in list_tasks():
+        assert specification(task, "identifier")["text"] == task
+
+
+def test_the_identifier_style_is_distinct_from_the_other_two():
+    from examples.advanced.robocasa.study_tasks import SPECIFICATION_STYLES, specification
+
+    assert set(SPECIFICATION_STYLES) == {"default", "vague", "identifier"}
+    texts = {specification("PickPlaceCounterToCabinet", s)["text"]
+             for s in SPECIFICATION_STYLES}
+    assert len(texts) == 3
+
+
+def test_the_vla_flips_frames_to_the_training_convention():
+    """Robosuite renders bottom-up; the dataset was converted top-down.
+
+    Settled against a decoded training frame: its bottom quarter is brighter
+    than its top while ours is the reverse, and the row-brightness profile
+    correlates -0.120 as rendered against +0.570 flipped.
+    """
+    from examples.advanced.robocasa.study_vla import FLIP_IMAGES, SmolVlaMethod
+
+    assert FLIP_IMAGES is True
+    assert SmolVlaMethod().flip_images is True
+    assert SmolVlaMethod().describe()["flip_images"] is True
+    assert SmolVlaMethod(flip_images=False).describe()["flip_images"] is False

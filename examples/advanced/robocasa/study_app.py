@@ -89,7 +89,8 @@ def main(argv=None) -> int:
     parser.add_argument("--representation", default="eef_delta",
                         help="Action representation; eef_delta_base commands the mobile base.")
     parser.add_argument("--max-steps", type=int, default=200)
-    parser.add_argument("--specification", choices=("default", "vague"), default="default",
+    parser.add_argument("--specification", choices=("default", "vague", "identifier"),
+                        default="default",
                         help="Task-specification axis: RoboCasa's goal, or the derived "
                              "instruction that withholds the object's identity.")
     parser.add_argument("--vla-tasks", action="store_true",
@@ -105,11 +106,14 @@ def main(argv=None) -> int:
 
     def build(task, representation):
         if representation == "lerobot_12":
-            # The checkpoint fixes its own observation and state format.
+            # The checkpoint fixes its own observation and state format, and its
+            # language conditioning is the task identifier unless asked
+            # otherwise - handing it prose is out of distribution.
+            style = args.specification if args.specification != "default" else "identifier"
             return RoboCasaPnPEnvironment(
                 task=task, representation=representation,
                 observation=vla_observation(), state_mode="lerobot",
-                specification_style=args.specification)
+                specification_style=style)
         return RoboCasaPnPEnvironment(
             task=task, representation=representation,
             command_base=representation == "eef_delta_base",

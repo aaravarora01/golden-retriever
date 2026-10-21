@@ -210,7 +210,16 @@ def ablation_subset(count: int = 8) -> tuple:
 # demonstrations, and the dataset links for this RoboCasa revision are dead (see
 # STUDY.md).
 
-SPECIFICATION_STYLES = ("default", "vague")
+#: The study's task-specification axis.
+#:
+#: `identifier` exists because a released checkpoint's language conditioning is
+#: not always a sentence. `lerobot/robocasa_target_human_unified` stores its
+#: `tasks` field as the environment name — `['PickPlaceCounterToCabinet']`, not
+#: a description — so a policy trained on it is conditioned on the identifier,
+#: and handing it prose is out of distribution. Measured on that checkpoint, one
+#: episode, 600 steps: the identifier reaches the object (score 25, hand within
+#: 6.7 cm) and RoboCasa's own goal sentence does not (score 0, 10.2 cm).
+SPECIFICATION_STYLES = ("default", "vague", "identifier")
 
 _FIXTURE_WORDS = {
     "Counter": "counter", "Cabinet": "cabinet", "Sink": "sink", "Microwave": "microwave",
@@ -245,6 +254,9 @@ def specification(task, style: str = "default") -> dict:
     if style == "default":
         return {"text": entry.goal, "style": "default", "derived": False,
                 "names_object": True}
+    if style == "identifier":
+        return {"text": entry.task, "style": "identifier", "derived": False,
+                "names_object": False}
     fixtures = _split_fixtures(entry.task)
     if fixtures is None:
         return {"text": "Move the object to where it belongs.", "style": "vague",
