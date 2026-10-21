@@ -53,11 +53,31 @@ TRAINING_DATASET = "lerobot/robocasa_target_human_unified"
 #: `agentview_right` is a RoboCasa-only role, so an observation configured for
 #: this policy reports `portable: False` — DROID has no second agentview.
 LEROBOT_VIEWS = ("over_shoulder", "agentview_right", "wrist")
-#: The feature keys its preprocessor expects for those views.
-LEROBOT_IMAGE_KEYS = ("observation.images.robot0_agentview_left",
-                      "observation.images.robot0_agentview_right",
-                      "observation.images.robot0_eye_in_hand")
-#: Robosuite observables that concatenate, in order, into the 16-wide state.
+#: The feature keys the *model* declares, in view order.
+#:
+#: The released preprocessor renames the dataset's `robot0_*` keys to these, and
+#: the pinned lerobot has no such step, so the batch is built under the model's
+#: own names. The rename map in the checkpoint fixes the order and it is not a
+#: guess: `robot0_agentview_left` is camera1, `robot0_agentview_right` is
+#: camera2, `robot0_eye_in_hand` is camera3.
+LEROBOT_IMAGE_KEYS = ("observation.images.camera1",
+                      "observation.images.camera2",
+                      "observation.images.camera3")
+#: The dataset keys those correspond to, in the same order.
+LEROBOT_DATASET_IMAGE_KEYS = ("observation.images.robot0_agentview_left",
+                              "observation.images.robot0_agentview_right",
+                              "observation.images.robot0_eye_in_hand")
+#: Robosuite observables the 16-wide state is built from, in order.
+#:
+#: The end-effector pose is **not** used as robosuite reports it. The checkpoint
+#: family documents this vector as "base pose (position 3 + quaternion 4), EE
+#: pose *in base frame* (position 3 + quaternion 4), gripper finger positions
+#: (2)", and robosuite's `robot0_eef_pos` is in world coordinates. The
+#: distinction is not cosmetic and the dataset's own statistics settle it: state
+#: dimensions 7-9 have mean (0.287, -0.021, 0.483), while at reset this robot's
+#: world-frame hand is at (0.658, -0.575, 1.312) and its base-frame hand is at
+#: (0.240, -0.009, 0.612). Feeding the world frame would put the policy's
+#: proprioception in a space it never saw, and nothing would raise.
 LEROBOT_STATE_KEYS = ("robot0_base_pos", "robot0_base_quat", "robot0_eef_pos",
                       "robot0_eef_quat", "robot0_gripper_qpos")
 #: Width of that state, asserted rather than assumed.
@@ -79,8 +99,104 @@ NATIVE_FROM_LEROBOT = (5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4)
 FROZEN_LEROBOT_DIMS = (3,)
 
 
+#: Config fields the released checkpoint carries that this pinned lerobot does
+#: not accept — it was saved by a newer version. Each was checked to be inert
+#: for inference before being dropped: `use_peft` is false so there are no
+#: adapters folded into the weights, `rtc_config` is null, `compile_model` is
+#: false (which makes `compile_mode` moot), and `pretrained_path` records
+#: provenance. Dropping an *architecture* field would silently build the wrong
+#: model, so this list is narrow on purpose and the loader refuses anything it
+#: has not been told about.
+INERT_CONFIG_FIELDS = ("use_peft", "pretrained_path", "rtc_config",
+                       "compile_model", "compile_mode")
+
+
 class VlaUnavailable(RuntimeError):
     """The checkpoint or its dependencies could not be loaded."""
+
+
+#: Which normalisation statistic feeds which buffer inside the policy.
+#:
+#: The released checkpoint keeps these in a separate processor safetensors — the
+#: newer lerobot's pipeline format — so loading the model alone leaves the
+#: normaliser at its uninitialised sentinel. State and action are MEAN_STD
+#: normalised, which means an uninitialised normaliser does not fail loudly: it
+#: produces plausible-looking nonsense. Images are IDENTITY normalised and so
+#: need no statistics, which is why only two features appear here.
+NORMALIZATION_SOURCES = (
+    ("normalize_inputs", "buffer_observation_state.mean", "observation.state.mean"),
+    ("normalize_inputs", "buffer_observation_state.std", "observation.state.std"),
+    ("unnormalize_outputs", "buffer_action.mean", "action.mean"),
+    ("unnormalize_outputs", "buffer_action.std", "action.std"),
+)
+
+
+def install_normalization(policy, directory) -> dict:
+    """Load the released normalisation statistics into `policy`.
+
+    Returns what was installed, so a run can show the normaliser was populated
+    rather than leaving it to be assumed. Raises if any statistic is missing,
+    misshaped or non-finite — all three would otherwise surface as a policy
+    that runs and is simply wrong.
+    """
+    from pathlib import Path
+
+    import torch
+    from safetensors.torch import load_file
+
+    stats: dict = {}
+    for path in sorted(Path(directory).glob("*processor*.safetensors")):
+        stats.update(load_file(str(path)))
+    if not stats:
+        raise VlaUnavailable(f"no processor statistics found in {directory}")
+    installed = {}
+    for module_name, buffer_key, stat_key in NORMALIZATION_SOURCES:
+        module = getattr(policy, module_name, None)
+        if module is None:
+            raise VlaUnavailable(f"policy has no {module_name}")
+        current = module.state_dict()
+        if buffer_key not in current:
+            raise VlaUnavailable(f"{module_name} has no {buffer_key}")
+        if stat_key not in stats:
+            raise VlaUnavailable(f"statistics are missing {stat_key}")
+        value = stats[stat_key].reshape(current[buffer_key].shape).to(
+            current[buffer_key].dtype)
+        if not bool(torch.isfinite(value).all()):
+            raise VlaUnavailable(f"{stat_key} is not finite")
+        module.load_state_dict({buffer_key: value}, strict=False)
+        installed[f"{module_name}.{buffer_key}"] = stat_key
+    for module_name, buffer_key, _ in NORMALIZATION_SOURCES:
+        tensor = getattr(policy, module_name).state_dict()[buffer_key]
+        if not bool(torch.isfinite(tensor).all()):
+            raise VlaUnavailable(
+                f"{module_name}.{buffer_key} is still uninitialised after loading")
+    return installed
+
+
+def prepare_checkpoint(checkpoint: str = DEFAULT_CHECKPOINT, *, cache_dir=None) -> str:
+    """Fetch `checkpoint` and drop only the config fields known to be inert.
+
+    Returns a local directory the pinned lerobot can load. The rewrite is
+    recorded in the returned directory so a run can show what was changed.
+    """
+    import json
+    import shutil
+    from pathlib import Path
+
+    from huggingface_hub import snapshot_download
+
+    source = Path(snapshot_download(checkpoint))
+    target = Path(cache_dir) if cache_dir else source.parent / f"{source.name}-compat"
+    target.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        if item.is_file() and not (target / item.name).exists():
+            shutil.copy2(item, target / item.name)
+    config = json.loads((source / "config.json").read_text())
+    dropped = {key: config.pop(key) for key in INERT_CONFIG_FIELDS if key in config}
+    (target / "config.json").write_text(json.dumps(config, indent=2))
+    (target / "retriever_compat.json").write_text(
+        json.dumps({"checkpoint": checkpoint, "dropped": dropped}, indent=2, sort_keys=True))
+    return str(target)
 
 
 def to_native_action(row) -> np.ndarray:
@@ -93,14 +209,44 @@ def to_native_action(row) -> np.ndarray:
     return values[list(NATIVE_FROM_LEROBOT)]
 
 
+def _canonical(quaternion) -> np.ndarray:
+    """Flip a quaternion to the `w >= 0` half, the convention in the data.
+
+    Measured: state dimension 13, the relative rotation's `w`, spans 0 to 0.999
+    across 15 million frames and never goes negative. A quaternion and its
+    negation are the same rotation, so without this the policy would sometimes
+    receive the numerically opposite encoding of a pose it knows.
+    """
+    values = np.asarray(quaternion, dtype=np.float64)
+    return -values if values[3] < 0.0 else values
+
+
 def lerobot_state(raw) -> np.ndarray:
-    """Concatenate this robot's observables into the policy's 16-wide state."""
-    parts = []
+    """Build the policy's 16-wide state from this robot's observables.
+
+    The end-effector pose is converted into the base frame, which is what the
+    checkpoint was trained on; see `LEROBOT_STATE_KEYS` for how that was
+    established.
+    """
+    from robosuite.utils.transform_utils import quat2mat, quat_inverse, quat_multiply
+
     for key in LEROBOT_STATE_KEYS:
         if key not in raw:
             raise KeyError(f"observation is missing {key!r}")
-        parts.append(np.asarray(raw[key], dtype=np.float32).reshape(-1))
-    state = np.concatenate(parts)
+    base_position = np.asarray(raw["robot0_base_pos"], dtype=np.float64).reshape(-1)
+    base_quaternion = _canonical(
+        np.asarray(raw["robot0_base_quat"], dtype=np.float64).reshape(-1))
+    hand_position = np.asarray(raw["robot0_eef_pos"], dtype=np.float64).reshape(-1)
+    hand_quaternion = np.asarray(raw["robot0_eef_quat"], dtype=np.float64).reshape(-1)
+    gripper = np.asarray(raw["robot0_gripper_qpos"], dtype=np.float64).reshape(-1)
+    if base_quaternion.shape != (4,) or hand_quaternion.shape != (4,):
+        raise ValueError("base and hand quaternions must each be 4 wide")
+    rotation = quat2mat(base_quaternion)
+    relative_position = rotation.T @ (hand_position - base_position)
+    relative_quaternion = _canonical(
+        quat_multiply(quat_inverse(base_quaternion), hand_quaternion))
+    state = np.concatenate([base_position, base_quaternion, relative_position,
+                            relative_quaternion, gripper]).astype(np.float32)
     if state.shape != (LEROBOT_STATE_DOF,):
         raise ValueError(f"state assembled to {state.shape}, expected "
                          f"({LEROBOT_STATE_DOF},)")
@@ -149,6 +295,12 @@ class SmolVlaMethod:
     calls: int = 0
     inferences: int = 0
     frozen_commands: int = 0
+    #: Whether the checkpoint had to be loaded through the field-dropping
+    #: shim above, so a run records that it was not loaded as published.
+    compat_shim: bool = False
+    #: Which released statistic went into which normaliser buffer, recorded so
+    #: a run shows the normaliser was populated rather than assumed.
+    normalization: dict = field(default_factory=dict)
     _queue: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -168,10 +320,22 @@ class SmolVlaMethod:
             raise VlaUnavailable(f"lerobot/transformers unavailable: {error}") from error
         try:
             policy = SmolVLAPolicy.from_pretrained(self.checkpoint)
-        except Exception as error:  # pragma: no cover - network-dependent
-            raise VlaUnavailable(f"could not load {self.checkpoint}: {error}") from error
+        except Exception as direct:
+            # The released config carries fields a newer lerobot writes. Retry
+            # against a copy with only the inert ones removed, and say so.
+            try:
+                local = prepare_checkpoint(self.checkpoint)
+                policy = SmolVLAPolicy.from_pretrained(local)
+                self.compat_shim = True
+            except Exception as error:  # pragma: no cover - network-dependent
+                raise VlaUnavailable(
+                    f"could not load {self.checkpoint}: {direct}; "
+                    f"compatibility retry also failed: {error}") from error
         policy.eval()
         policy.to(torch.device(self.device))
+        # Must happen after loading: the model file carries no statistics.
+        self.normalization = install_normalization(
+            policy, prepare_checkpoint(self.checkpoint))
         self.policy = policy
 
     def reset(self) -> None:
@@ -238,4 +402,6 @@ class SmolVlaMethod:
                 "horizon": self.horizon, "device": self.device,
                 "source": self.source, "calls": self.calls,
                 "inferences": self.inferences,
-                "frozen_commands": self.frozen_commands}
+                "frozen_commands": self.frozen_commands,
+                "compat_shim": self.compat_shim,
+                "normalization": dict(self.normalization)}

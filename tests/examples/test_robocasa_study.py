@@ -1711,8 +1711,50 @@ def test_the_lerobot_state_is_sixteen_wide_in_the_documented_order():
 
     state = lerobot_state(_raw_state())
     assert state.shape == (LEROBOT_STATE_DOF,)
-    assert state.tolist() == pytest.approx(
-        [1.0, 2.0, 0.7, 0.0, 0.0, 0.3, 0.95, 0.4, -0.3, 1.0, 0.1, 0.2, 0.3, 0.9, 0.03, -0.03])
+    # base pose passes through unchanged; the hand pose does not (see below).
+    assert state[:7].tolist() == pytest.approx([1.0, 2.0, 0.7, 0.0, 0.0, 0.3, 0.95])
+    assert state[14:].tolist() == pytest.approx([0.03, -0.03])
+
+
+def test_the_hand_pose_is_converted_into_the_base_frame():
+    """The checkpoint was trained on a base-frame hand pose, not a world one.
+
+    Robosuite reports `robot0_eef_pos` in world coordinates, and feeding that
+    through would put the policy's proprioception in a space it never saw while
+    raising nothing. With the base at the origin and unrotated, the two frames
+    coincide; rotate or translate the base and they must not.
+    """
+    from examples.advanced.robocasa.study_vla import lerobot_state
+
+    identity = _raw_state(robot0_base_pos=np.zeros(3),
+                          robot0_base_quat=np.array([0.0, 0.0, 0.0, 1.0]))
+    assert lerobot_state(identity)[7:10].tolist() == pytest.approx([0.4, -0.3, 1.0])
+    # A base translated by one metre in x sees the hand one metre nearer.
+    shifted = _raw_state(robot0_base_pos=np.array([1.0, 0.0, 0.0]),
+                         robot0_base_quat=np.array([0.0, 0.0, 0.0, 1.0]))
+    assert lerobot_state(shifted)[7:10].tolist() == pytest.approx([-0.6, -0.3, 1.0])
+    # A base yawed 90 degrees swaps the axes rather than leaving them alone.
+    turned = _raw_state(robot0_base_pos=np.zeros(3),
+                        robot0_base_quat=np.array([0.0, 0.0, np.sin(np.pi / 4),
+                                                   np.cos(np.pi / 4)]))
+    assert lerobot_state(turned)[7:10].tolist() == pytest.approx([-0.3, -0.4, 1.0], abs=1e-6)
+
+
+def test_the_relative_rotation_is_canonicalised_to_positive_w():
+    """Measured: state dimension 13 never goes negative across 15M frames."""
+    from examples.advanced.robocasa.study_vla import lerobot_state
+
+    for sign in (1.0, -1.0):
+        raw = _raw_state(robot0_base_quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                         robot0_eef_quat=sign * np.array([0.1, 0.2, 0.3, 0.9]))
+        state = lerobot_state(raw)
+        assert state[13] >= 0.0
+    # Both signs encode the same rotation, so both must give the same state.
+    first = lerobot_state(_raw_state(robot0_base_quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                                     robot0_eef_quat=np.array([0.1, 0.2, 0.3, 0.9])))
+    second = lerobot_state(_raw_state(robot0_base_quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                                      robot0_eef_quat=-np.array([0.1, 0.2, 0.3, 0.9])))
+    assert first.tolist() == pytest.approx(second.tolist(), abs=1e-6)
 
 
 def test_a_missing_state_observable_is_named():
