@@ -2119,3 +2119,169 @@ def test_the_official_trial_count_is_recorded():
     assert OFFICIAL_TRIALS == 50
     # Our own protocol is cheaper and must not be mistaken for theirs.
     assert len(DEFAULT_SEEDS) < OFFICIAL_TRIALS
+
+
+# --- running a Retriever Flow as a study method --------------------------
+
+
+class _FakeFlow:
+    """A minimal stand-in for Flow[PolicyObservation, ActionChunk]."""
+
+    def __init__(self, horizon=10, dof=7, source="mock"):
+        self.horizon, self.dof, self.source = horizon, dof, source
+        self.reset_calls = 0
+        self.steps = 0
+
+    def init_config(self):
+        return {"horizon": self.horizon, "dof": self.dof}
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def step(self, observation):
+        from examples.advanced.openpi_policy.common import ActionChunk
+
+        self.steps += 1
+        rows = np.arange(self.horizon * self.dof, dtype=np.float32)
+        rows = (rows.reshape(self.horizon, self.dof) % 1.0)
+        rows[:, 0] = np.arange(self.horizon, dtype=np.float32)
+        return ActionChunk(actions=rows, horizon=self.horizon, dof=self.dof,
+                           source=self.source)
+
+
+def test_a_flow_policy_runs_as_a_study_method():
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    flow = _FakeFlow()
+    method = FlowMethod(policy=flow)
+    assert flow.reset_calls == 1  # reset once at construction, not per predict
+    chunk = method.predict(_observation())
+    assert chunk.actions.shape == (10, 7)
+    assert chunk.horizon == 10 and chunk.dof == 7
+    assert chunk.source == "mock"
+    assert flow.reset_calls == 1
+
+
+def test_take_truncates_a_chunk_the_way_the_official_client_does():
+    """`action_plan.extend(action_chunk[: replan_steps])` — the rest is dropped."""
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    method = FlowMethod(policy=_FakeFlow(horizon=50), take=5)
+    chunk = method.predict(_observation())
+    assert chunk.actions.shape == (5, 7)
+    assert chunk.horizon == 5
+    # Rows 0-4 of the proposal, in order; rows 5-49 discarded.
+    assert chunk.actions[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert method.rows_dispatched == 5
+    assert method.rows_discarded == 45
+
+
+def test_an_untruncated_chunk_keeps_the_policys_own_horizon():
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    method = FlowMethod(policy=_FakeFlow(horizon=32))
+    assert method.predict(_observation()).horizon == 32
+    assert method.rows_discarded == 0
+
+
+def test_the_adapter_records_the_policys_identity_and_config():
+    """A cell reproducible only from live Python objects is not reproducible."""
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    described = FlowMethod(policy=_FakeFlow(horizon=4, dof=8), take=2).describe()
+    assert described["policy_ref"].endswith(":_FakeFlow")
+    assert described["policy_config"] == {"horizon": 4, "dof": 8}
+    assert described["take"] == 2
+
+
+def test_a_policy_that_cannot_describe_itself_is_refused():
+    from examples.advanced.robocasa.study_flow_method import FlowContractError, FlowMethod
+
+    class Anonymous:
+        def step(self, observation):
+            return None
+
+    with pytest.raises(FlowContractError, match="init_config"):
+        FlowMethod(policy=Anonymous())
+
+
+def test_a_non_flow_is_refused():
+    from examples.advanced.robocasa.study_flow_method import FlowContractError, FlowMethod
+
+    class NotAFlow:
+        def init_config(self):
+            return {}
+
+    with pytest.raises(FlowContractError, match="no step"):
+        FlowMethod(policy=NotAFlow())
+
+
+def test_a_misshaped_chunk_from_a_flow_is_refused():
+    from examples.advanced.openpi_policy.common import ActionChunk
+    from examples.advanced.robocasa.study_flow_method import FlowContractError, FlowMethod
+
+    class Broken(_FakeFlow):
+        def step(self, observation):
+            return ActionChunk(actions=np.zeros(7, dtype=np.float32), horizon=1,
+                               dof=7, source="mock")
+
+    method = FlowMethod(policy=Broken())
+    with pytest.raises(FlowContractError, match=r"\(horizon, dof\)"):
+        method.predict(_observation())
+
+
+def test_the_adapter_does_not_relabel_a_policys_source_by_default():
+    """A method must not be able to launder its own provenance."""
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    assert FlowMethod(policy=_FakeFlow(source="mock")).predict(
+        _observation()).source == "mock"
+    assert FlowMethod(policy=_FakeFlow(source="mock"),
+                      source="model").predict(_observation()).source == "model"
+
+
+@pytest.mark.parametrize("take", [0, 65, 5.0])
+def test_an_unusable_take_is_rejected(take):
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    with pytest.raises(ValueError, match="take"):
+        FlowMethod(policy=_FakeFlow(), take=take)
+
+
+def test_the_real_openpi_mock_policy_works_through_the_bridge():
+    """The lane's own CI policy, unmodified, as a study arm."""
+    from examples.advanced.openpi_policy.common import MockPi05Policy
+    from examples.advanced.robocasa.method_harness import SafetyEnvelope
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    # A bounded state: this mock scales its output straight off the state, so
+    # arange(7) would hand the envelope actions of magnitude 6.
+    observation = policy_observation(frames=[[_frame()]],
+                                     state=np.full(7, 0.2, dtype=np.float32),
+                                     prompt="pick the cube")
+    method = FlowMethod(policy=MockPi05Policy(), take=5)
+    chunk = method.predict(observation)
+    assert chunk.actions.shape == (5, 7)
+    assert method.describe()["policy_ref"] == (
+        "examples.advanced.openpi_policy.common:MockPi05Policy")
+    assert method.describe()["policy_config"] == {"horizon": 10, "dof": 7}
+    SafetyEnvelope(allowed_sources=frozenset({"mock"})).validate(chunk)
+
+
+def test_the_reported_dof_is_measured_not_claimed():
+    """A policy's declared width and its emitted width can disagree.
+
+    `MockPi05Policy.step` slices `base[None, : self.dof]`, so a state narrower
+    than `dof` yields narrower actions while the chunk still declares the wider
+    `dof`. The envelope and the scorer must see the array that will actually be
+    dispatched, so the adapter recomputes the width rather than trusting the
+    label.
+    """
+    from examples.advanced.openpi_policy.common import MockPi05Policy
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+
+    method = FlowMethod(policy=MockPi05Policy(dof=7))
+    chunk = method.predict(_observation(state=5))
+    assert chunk.actions.shape[1] == 5     # what will be dispatched
+    assert chunk.dof == 5                  # not the policy's claim of 7
+    assert method.describe()["policy_config"]["dof"] == 7
