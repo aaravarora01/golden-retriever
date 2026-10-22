@@ -2294,3 +2294,37 @@ def test_the_reported_dof_is_measured_not_claimed():
     assert chunk.actions.shape[1] == 5     # what will be dispatched
     assert chunk.dof == 5                  # not the policy's claim of 7
     assert method.describe()["policy_config"]["dof"] == 7
+
+
+def test_per_task_horizons_override_the_flat_cap(tmp_path):
+    """The official protocol gives each task its own budget."""
+    from examples.advanced.robocasa.study_sweep import Sweep
+
+    seen = {}
+
+    class _Recording(_FakeEnvironment):
+        def reset(self, request):
+            seen[self.task] = request.max_steps
+            return super().reset(request)
+
+    sweep = Sweep(
+        build_environment=lambda task, representation: _Recording(
+            task=task, representation=representation),
+        tasks=("T", "U"), seeds=(0,), max_steps=400,
+        horizons={"T": 750})
+    summary = sweep.run(_cell_specs())
+    assert seen == {"T": 750, "U": 400}   # named task overridden, other falls back
+    assert summary["protocol"]["horizons"] == {"T": 750}
+
+
+def test_the_official_horizons_are_per_task_and_in_range():
+    """Read from robocasa's registry, which is where the official client reads."""
+    from examples.advanced.robocasa.study_tasks import ATOMIC_SEEN_TASKS
+
+    pytest.importorskip("robocasa")
+    from examples.advanced.robocasa.study_tasks import official_horizon
+
+    values = {t: official_horizon(t) for t in ATOMIC_SEEN_TASKS}
+    assert all(450 <= v <= 1050 for v in values.values())
+    # Not a flat cap - a single number would starve the long tasks.
+    assert len(set(values.values())) > 1

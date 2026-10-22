@@ -382,21 +382,47 @@ class RoboCasaPnPEnvironment:
         scorer may read the object's pose, a policy may not.
         """
         self._last_raw = raw
-        target = self.env.objects["obj"]
+        # The task predicate applies to every task and is what the leaderboard
+        # scores, so it is read first and unconditionally.
+        self._last_success = bool(self.env._check_success())
+        target = self._scored_object()
+        if target is None:
+            # Outside pick-and-place there is no single manipulated object, so
+            # the partial ladder does not apply. Reporting a 0 score for a task
+            # that has no ladder would read as a failure rather than as a
+            # metric that was never applicable, which is why `scored` exists.
+            return
         object_position = self.env.sim.data.body_xpos[
             self.env.sim.model.body_name2id(target.root_body)]
         grasped = bool(self.env._check_grasp(
             gripper=self.env.robots[0].gripper["right"],
             object_geoms=target.contact_geoms))
-        self._last_success = bool(self.env._check_success())
         self.progress.observe(
             gripper_position=self._eef_position(), object_position=object_position,
             grasped=grasped, success=self._last_success)
+
+    def _scored_object(self):
+        """The single manipulated object, when the task has one."""
+        objects = getattr(self.env, "objects", None)
+        if not isinstance(objects, dict):
+            return None
+        return objects.get("obj")
+
+    @property
+    def scored(self) -> bool:
+        """Whether the partial-score ladder applies to this task.
+
+        True for pick-and-place, false for the articulated and toggle tasks in
+        the leaderboard's atomic-seen split, which have no single object to
+        reach, grasp and lift. Binary success applies either way.
+        """
+        return self.env is not None and self._scored_object() is not None
 
     # --- what a run records about this backend -------------------------
 
     def describe(self) -> dict:
         return {"backend": "robocasa", "task": self.task, "robot": self.robot,
+                "scored": self.scored,
                 "layout_id": self.layout_id, "style_id": self.style_id,
                 "representation": self.representation, "exposed_dof": EXPOSED_DOF,
                 "observation": self.observation.to_dict(),

@@ -19,7 +19,8 @@ from .study_methods import RandomMethod, StillMethod
 from .study_reference import ScriptedPickMethod
 from .study_sweep import MethodSpec, Sweep, render
 from .study_tasks import (
-    DEFAULT_SEEDS, ablation_subset, get_task, list_tasks, vla_comparable)
+    ATOMIC_SEEN_TASKS, DEFAULT_SEEDS, ablation_subset, get_task, list_tasks,
+    official_horizon, vla_comparable)
 
 
 def baseline_specs(horizon: int, representation: str) -> tuple:
@@ -50,7 +51,7 @@ def reference_specs(horizon: int) -> tuple:
     )
 
 
-def vla_specs(horizon: int) -> tuple:
+def vla_specs(horizon: int, *, take: int | None = None) -> tuple:
     """A released RoboCasa VLA checkpoint, in its own representation.
 
     Its observation and action spaces are fixed by the checkpoint — three views
@@ -61,11 +62,11 @@ def vla_specs(horizon: int) -> tuple:
 
     # `horizon` does not apply: the checkpoint fixes its own 50-step proposal
     # and the benchmark fixes how much of it runs before re-planning.
+    chosen = REPLAN_STEPS if take is None else take
     return (
-        MethodSpec(method_id="smolvla", horizon=REPLAN_STEPS,
-                   representation="lerobot_12",
+        MethodSpec(method_id="smolvla", horizon=chosen, representation="lerobot_12",
                    label="lerobot/smolvla_robocasa as a Flow; trained, not privileged",
-                   build=lambda env: smolvla_arm(take=REPLAN_STEPS)),
+                   build=lambda env, t=chosen: smolvla_arm(take=t)),
     )
 
 
@@ -98,6 +99,17 @@ def main(argv=None) -> int:
                              "instruction that withholds the object's identity.")
     parser.add_argument("--vla-tasks", action="store_true",
                         help="Run only the tasks the released VLA checkpoint also knows.")
+    parser.add_argument("--atomic-seen", action="store_true",
+                        help="Run the leaderboard's 18-task atomic-seen split, which is "
+                             "the column its published success rates are reported in. "
+                             "Thirteen of them are not pick-and-place, so the partial "
+                             "score does not apply and binary success is the metric.")
+    parser.add_argument("--official-horizons", action="store_true",
+                        help="Give each task the episode budget the official client "
+                             "gives it, instead of a flat --max-steps.")
+    parser.add_argument("--take", type=int, default=None,
+                        help="Actions consumed per inference by a Flow policy; the "
+                             "official client uses 5. Omit to use that default.")
     parser.add_argument("--methods", choices=("baselines", "reference", "vla", "both"),
                         default="baselines",
                         help="Which arms to run. The reference is privileged and always "
@@ -129,6 +141,8 @@ def main(argv=None) -> int:
     try:
         if args.tasks:
             tasks = tuple(get_task(name).task for name in args.tasks)
+        elif args.atomic_seen:
+            tasks = ATOMIC_SEEN_TASKS
         elif args.vla_tasks:
             tasks = vla_comparable()
         elif args.all_tasks:
@@ -141,13 +155,16 @@ def main(argv=None) -> int:
         if args.methods in ("reference", "both"):
             specs += reference_specs(args.horizon)
         if args.methods == "vla":
-            specs += vla_specs(args.horizon)
+            specs += vla_specs(args.horizon, take=args.take)
         # A model's output is admitted only when a model arm is actually in
         # the sweep, so the default stays scripted-only.
         sources = ("scripted", "model") if args.methods == "vla" else ("scripted",)
+        horizons = ({task: official_horizon(task) for task in tasks}
+                    if args.official_horizons else {})
         sweep = Sweep(build_environment=build, tasks=tasks,
                       seeds=tuple(args.seeds), max_steps=args.max_steps,
-                      allowed_sources=sources, checkpoint=args.checkpoint)
+                      horizons=horizons, allowed_sources=sources,
+                      checkpoint=args.checkpoint)
         summary = sweep.run(specs)
     except (ValueError, TypeError, OSError) as error:
         print(render({"error": f"{type(error).__name__}: {error}"}))

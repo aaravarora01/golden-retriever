@@ -87,6 +87,10 @@ class Sweep:
     tasks: tuple = ("PickPlaceCounterToCabinet",)
     seeds: tuple = DEFAULT_SEEDS
     max_steps: int = 400
+    #: Per-task episode budgets, overriding `max_steps`. The official protocol
+    #: gives each task its own horizon (450 to 1050 across atomic-seen), so a
+    #: flat cap either starves the long tasks or flatters the short ones.
+    horizons: dict = field(default_factory=dict)
     #: Action sources the envelope admits. Scripted only by default, so
     #: admitting a model's output is a deliberate, recorded widening rather
     #: than a method quietly mislabelling itself to get through.
@@ -169,7 +173,7 @@ class Sweep:
         started = perf_counter()
         report = harness.run(
             TrialRequest(method_id=spec.method_id, task=task, episode=seed, seed=seed,
-                         max_steps=self.max_steps),
+                         max_steps=int(self.horizons.get(task, self.max_steps))),
             environment=environment, method=method, close_environment=False)
         latency = perf_counter() - started
         # One `chunk_dispatched` event per `predict`, which is the study's
@@ -221,6 +225,7 @@ class Sweep:
         return {"schema_version": 1,
                 "protocol": {"tasks": list(self.tasks), "seeds": list(self.seeds),
                              "max_steps": self.max_steps,
+                             "horizons": dict(sorted(self.horizons.items())),
                              "allowed_sources": sorted(self.allowed_sources),
                              "resumed_episodes": self.resumed,
                              "episodes": len(self.tasks) * len(self.seeds)},
