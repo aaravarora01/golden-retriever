@@ -86,6 +86,17 @@ LEROBOT_STATE_DOF = 16
 LEROBOT_ACTION_DOF = 12
 #: Native image side the checkpoint's config declares.
 LEROBOT_IMAGE_SIZE = 256
+#: Actions taken from each predicted chunk before re-planning.
+#:
+#: This is the RoboCasa365 leaderboard's own value, read from the official
+#: evaluation client (`robocasa-benchmark/openpi`,
+#: `examples/robocasa/main.py`): `replan_steps: int = 5`, applied as
+#: `action_plan.extend(action_chunk[: replan_steps])`. The remainder of the
+#: chunk is discarded. A checkpoint that predicts 50 steps is therefore
+#: evaluated closed-loop at every fifth step, not open-loop across all fifty,
+#: and matching that is a condition of comparability rather than a tuning
+#: choice.
+REPLAN_STEPS = 5
 #: Whether to flip rendered frames vertically before the policy sees them.
 #:
 #: Robosuite's `IMAGE_CONVENTION` defaults to `opengl`, which returns frames
@@ -327,6 +338,9 @@ class SmolVlaMethod:
     device: str = "cpu"
     #: Flip frames to the convention the checkpoint was trained under.
     flip_images: bool = FLIP_IMAGES
+    #: Actions consumed per inference before re-planning; the rest of the
+    #: predicted chunk is discarded, as the official client does.
+    replan_steps: int = REPLAN_STEPS
     policy: object = None
     calls: int = 0
     inferences: int = 0
@@ -342,6 +356,8 @@ class SmolVlaMethod:
     def __post_init__(self) -> None:
         if type(self.horizon) is not int or not 1 <= self.horizon <= 50:
             raise ValueError("horizon must be an int from 1 through 50")
+        if type(self.replan_steps) is not int or not 1 <= self.replan_steps <= 50:
+            raise ValueError("replan_steps must be an int from 1 through 50")
         if not isinstance(self.checkpoint, str) or not self.checkpoint.strip():
             raise ValueError("checkpoint must be a non-empty string")
 
@@ -386,7 +402,10 @@ class SmolVlaMethod:
         rows = []
         for _ in range(self.horizon):
             if not self._queue:
-                self._queue.extend(self._infer(observation))
+                # Keep only the leading `replan_steps` and discard the rest, so
+                # the policy is re-queried on a fresh observation at the
+                # official cadence.
+                self._queue.extend(self._infer(observation)[: self.replan_steps])
             rows.append(self._queue.pop(0))
         actions = np.asarray(rows, dtype=np.float32)
         self.frozen_commands += int(
@@ -439,6 +458,7 @@ class SmolVlaMethod:
                 "training_dataset": TRAINING_DATASET, "privileged": False,
                 "horizon": self.horizon, "device": self.device,
                 "flip_images": self.flip_images,
+                "replan_steps": self.replan_steps,
                 "source": self.source, "calls": self.calls,
                 "inferences": self.inferences,
                 "frozen_commands": self.frozen_commands,

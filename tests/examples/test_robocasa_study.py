@@ -2034,3 +2034,88 @@ def test_blank_checkpoint_lines_are_tolerated(tmp_path):
                    checkpoint=str(path))
     second.run(_cell_specs())
     assert second.resumed == 1
+
+
+def test_the_replan_cadence_is_the_leaderboards_own_value():
+    """Read from the official evaluation client, not chosen by us.
+
+    `robocasa-benchmark/openpi`, `examples/robocasa/main.py` declares
+    `replan_steps: int = 5` and applies `action_chunk[: replan_steps]`, so a
+    checkpoint predicting fifty steps is evaluated closed-loop every fifth one.
+    Matching it is a condition of comparability.
+    """
+    from examples.advanced.robocasa.study_vla import REPLAN_STEPS, SmolVlaMethod
+
+    assert REPLAN_STEPS == 5
+    assert SmolVlaMethod().replan_steps == 5
+    assert SmolVlaMethod().describe()["replan_steps"] == 5
+
+
+@pytest.mark.parametrize("value", [0, 51, 5.0])
+def test_an_unusable_replan_cadence_is_rejected(value):
+    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+
+    with pytest.raises(ValueError, match="replan_steps"):
+        SmolVlaMethod(replan_steps=value)
+
+
+def test_only_the_leading_actions_of_a_chunk_are_consumed():
+    """The rest is discarded, which is what makes the policy closed-loop."""
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, SmolVlaMethod
+
+    calls = []
+
+    def fake_infer(observation, _c=calls):
+        _c.append(1)
+        return [np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)]
+
+    method = SmolVlaMethod(horizon=1, replan_steps=5)
+    method._infer = fake_infer  # type: ignore[method-assign]
+    first = [method.predict(_observation()).actions[0][0] for _ in range(5)]
+    assert first == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert len(calls) == 1
+    # The sixth step must trigger a fresh inference rather than continue into
+    # action 5 of the stale chunk.
+    assert method.predict(_observation()).actions[0][0] == 0.0
+    assert len(calls) == 2
+
+
+def test_a_wider_cadence_consumes_more_of_each_chunk():
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, SmolVlaMethod
+
+    calls = []
+
+    def fake_infer(observation, _c=calls):
+        _c.append(1)
+        return [np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)]
+
+    method = SmolVlaMethod(horizon=1, replan_steps=50)
+    method._infer = fake_infer  # type: ignore[method-assign]
+    for _ in range(50):
+        method.predict(_observation())
+    assert len(calls) == 1
+
+
+def test_the_atomic_seen_split_is_eighteen_tasks_with_five_pick_and_place():
+    """The leaderboard's split, not ours.
+
+    Reconstruction check: the mean of REKI's 18 per-task rates is 65.8, exactly
+    the atomic_seen_success it reports, which is what confirms the membership.
+    """
+    from examples.advanced.robocasa.study_tasks import (
+        ATOMIC_SEEN_TASKS, VLA_COMPARABLE_TASKS)
+
+    assert len(ATOMIC_SEEN_TASKS) == 18
+    assert len(set(ATOMIC_SEEN_TASKS)) == 18
+    pnp = [t for t in ATOMIC_SEEN_TASKS if t.startswith("PickPlace")]
+    assert len(pnp) == 5
+    # Our comparable set is exactly the pick-and-place part of their split.
+    assert sorted(pnp) == sorted(VLA_COMPARABLE_TASKS)
+
+
+def test_the_official_trial_count_is_recorded():
+    from examples.advanced.robocasa.study_tasks import DEFAULT_SEEDS, OFFICIAL_TRIALS
+
+    assert OFFICIAL_TRIALS == 50
+    # Our own protocol is cheaper and must not be mistaken for theirs.
+    assert len(DEFAULT_SEEDS) < OFFICIAL_TRIALS

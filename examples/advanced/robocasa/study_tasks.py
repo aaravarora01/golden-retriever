@@ -166,6 +166,41 @@ VLA_COMPARABLE_TASKS = (
 )
 
 
+#: The RoboCasa365 leaderboard's atomic-seen split, in its published order.
+#:
+#: Read from `kyutai/reki-2b-robocasa365`'s per-task table and confirmed by
+#: reconstruction: the mean of its 18 per-task rates is 65.8, which is exactly
+#: the `atomic_seen_success` it reports, so this is the right set. All 18 are
+#: registered in robocasa 1.0.1 — the leaderboard's current default version —
+#: and only 5 are pick-and-place, which is why this study's suite overlaps it
+#: so narrowly.
+ATOMIC_SEEN_TASKS = (
+    "CloseBlenderLid", "CloseFridge", "CloseToasterOvenDoor", "CoffeeSetupMug",
+    "NavigateKitchen", "OpenCabinet", "OpenDrawer", "OpenStandMixerHead",
+    "PickPlaceCounterToCabinet", "PickPlaceCounterToStove",
+    "PickPlaceDrawerToCounter", "PickPlaceSinkToCounter",
+    "PickPlaceToasterToCounter", "SlideDishwasherRack", "TurnOffStove",
+    "TurnOnElectricKettle", "TurnOnMicrowave", "TurnOnSinkFaucet",
+)
+#: Trials per task in the official protocol, from the evaluation client's
+#: `num_trials` default. Five seeds is this study's own, cheaper, setting and
+#: gives much wider intervals.
+OFFICIAL_TRIALS = 50
+
+
+def official_horizon(task: str) -> int:
+    """Episode budget the official protocol gives `task`.
+
+    Per-task rather than flat: the atomic-seen tasks range from 450 to 1050
+    steps, so a single cap either starves the long ones or flatters the short
+    ones. Read from robocasa's own registry, which is where the official
+    evaluation client reads it.
+    """
+    from robocasa.utils.dataset_registry_utils import get_task_horizon
+
+    return int(get_task_horizon(task))
+
+
 def vla_comparable() -> tuple:
     """The committed tasks a released RoboCasa checkpoint also knows."""
     known = set(list_tasks())
