@@ -1800,27 +1800,28 @@ def test_an_untileable_image_is_rejected(image, match):
 
 def test_the_vla_declares_itself_a_model_and_not_privileged():
     """It sees only images, state and the instruction - no simulator reads."""
-    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+    from examples.advanced.robocasa.study_vla import SmolVlaPolicy
 
-    described = SmolVlaMethod().describe()
+    described = SmolVlaPolicy().describe()
     assert described["source"] == "model"
     assert described["privileged"] is False
     assert described["checkpoint"] == "lerobot/smolvla_robocasa"
 
 
-@pytest.mark.parametrize("horizon", [0, 51, 1.0])
-def test_the_vla_rejects_an_unusable_horizon(horizon):
-    from examples.advanced.robocasa.study_vla import SmolVlaMethod
-
-    with pytest.raises(ValueError, match="horizon"):
-        SmolVlaMethod(horizon=horizon)
-
-
 def test_the_vla_rejects_an_empty_checkpoint():
-    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+    from examples.advanced.robocasa.study_vla import SmolVlaPolicy
 
     with pytest.raises(ValueError, match="checkpoint"):
-        SmolVlaMethod(checkpoint="  ")
+        SmolVlaPolicy(checkpoint="  ")
+
+
+def test_the_vla_policy_can_describe_itself_for_reconstruction():
+    """`init_config` is what lets a run record name and rebuild the policy."""
+    from examples.advanced.robocasa.study_vla import DEFAULT_CHECKPOINT, SmolVlaPolicy
+
+    config = SmolVlaPolicy().init_config()
+    assert config == {"checkpoint": DEFAULT_CHECKPOINT, "device": "cpu",
+                      "flip_images": True}
 
 
 def test_a_model_source_needs_the_envelope_widened_deliberately():
@@ -1923,12 +1924,12 @@ def test_the_vla_flips_frames_to_the_training_convention():
     than its top while ours is the reverse, and the row-brightness profile
     correlates -0.120 as rendered against +0.570 flipped.
     """
-    from examples.advanced.robocasa.study_vla import FLIP_IMAGES, SmolVlaMethod
+    from examples.advanced.robocasa.study_vla import FLIP_IMAGES, SmolVlaPolicy
 
     assert FLIP_IMAGES is True
-    assert SmolVlaMethod().flip_images is True
-    assert SmolVlaMethod().describe()["flip_images"] is True
-    assert SmolVlaMethod(flip_images=False).describe()["flip_images"] is False
+    assert SmolVlaPolicy().flip_images is True
+    assert SmolVlaPolicy().describe()["flip_images"] is True
+    assert SmolVlaPolicy(flip_images=False).describe()["flip_images"] is False
 
 
 # --- resumable sweeps ----------------------------------------------------
@@ -2044,56 +2045,64 @@ def test_the_replan_cadence_is_the_leaderboards_own_value():
     checkpoint predicting fifty steps is evaluated closed-loop every fifth one.
     Matching it is a condition of comparability.
     """
-    from examples.advanced.robocasa.study_vla import REPLAN_STEPS, SmolVlaMethod
+    from examples.advanced.robocasa.study_vla import REPLAN_STEPS
 
     assert REPLAN_STEPS == 5
-    assert SmolVlaMethod().replan_steps == 5
-    assert SmolVlaMethod().describe()["replan_steps"] == 5
 
 
-@pytest.mark.parametrize("value", [0, 51, 5.0])
-def test_an_unusable_replan_cadence_is_rejected(value):
-    from examples.advanced.robocasa.study_vla import SmolVlaMethod
+def test_the_vla_arm_is_a_flow_behind_the_official_cadence():
+    """The arm is the adapter plus the policy, not a bespoke method.
 
-    with pytest.raises(ValueError, match="replan_steps"):
-        SmolVlaMethod(replan_steps=value)
+    Truncation lives in `FlowMethod.take` and is tested there once, for every
+    policy, rather than reimplemented per checkpoint.
+    """
+    from examples.advanced.robocasa.study_flow_method import FlowMethod
+    from examples.advanced.robocasa.study_vla import (
+        REPLAN_STEPS, SmolVlaPolicy, smolvla_arm)
 
-
-def test_only_the_leading_actions_of_a_chunk_are_consumed():
-    """The rest is discarded, which is what makes the policy closed-loop."""
-    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, SmolVlaMethod
-
-    calls = []
-
-    def fake_infer(observation, _c=calls):
-        _c.append(1)
-        return [np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)]
-
-    method = SmolVlaMethod(horizon=1, replan_steps=5)
-    method._infer = fake_infer  # type: ignore[method-assign]
-    first = [method.predict(_observation()).actions[0][0] for _ in range(5)]
-    assert first == [0.0, 1.0, 2.0, 3.0, 4.0]
-    assert len(calls) == 1
-    # The sixth step must trigger a fresh inference rather than continue into
-    # action 5 of the stale chunk.
-    assert method.predict(_observation()).actions[0][0] == 0.0
-    assert len(calls) == 2
+    arm = smolvla_arm()
+    assert isinstance(arm, FlowMethod)
+    assert isinstance(arm.policy, SmolVlaPolicy)
+    assert arm.take == REPLAN_STEPS
+    assert arm.describe()["policy_ref"].endswith(":SmolVlaPolicy")
+    # The open-loop condition this study used before reading the protocol.
+    assert smolvla_arm(take=None).take is None
 
 
-def test_a_wider_cadence_consumes_more_of_each_chunk():
-    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, SmolVlaMethod
+def test_the_vla_policy_returns_its_whole_proposal():
+    """The policy proposes; the adapter decides how much of it runs.
 
-    calls = []
+    Keeping those apart is what makes the model-call count right: with the
+    chunk held in a private queue and one row handed out per call, the harness
+    saw one dispatch per control step and reported 1,130 model calls for an
+    episode with 23 inferences.
+    """
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, SmolVlaPolicy
 
-    def fake_infer(observation, _c=calls):
-        _c.append(1)
-        return [np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)]
+    policy = SmolVlaPolicy()
+    policy._infer = lambda observation: [  # type: ignore[method-assign]
+        np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)]
+    chunk = policy.step(_observation())
+    assert chunk.actions.shape == (50, LEROBOT_ACTION_DOF)
+    assert chunk.horizon == 50
+    assert policy.calls == 1
 
-    method = SmolVlaMethod(horizon=1, replan_steps=50)
-    method._infer = fake_infer  # type: ignore[method-assign]
-    for _ in range(50):
-        method.predict(_observation())
-    assert len(calls) == 1
+
+def test_the_arm_consumes_only_the_leading_actions_of_each_proposal():
+    """End to end through the adapter: 5 kept, 45 discarded, then re-inferred."""
+    from examples.advanced.robocasa.study_vla import LEROBOT_ACTION_DOF, smolvla_arm
+
+    arm = smolvla_arm()
+    inferences = []
+    arm.policy._infer = lambda observation: (  # type: ignore[method-assign]
+        inferences.append(1) or [np.full(LEROBOT_ACTION_DOF, float(i)) for i in range(50)])
+    first = arm.predict(_observation())
+    assert first.actions[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert arm.rows_dispatched == 5 and arm.rows_discarded == 45
+    assert len(inferences) == 1
+    # The harness dispatches those five, then asks again - a fresh inference.
+    arm.predict(_observation())
+    assert len(inferences) == 2
 
 
 def test_the_atomic_seen_split_is_eighteen_tasks_with_five_pick_and_place():

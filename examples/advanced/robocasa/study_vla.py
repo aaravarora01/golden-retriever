@@ -323,24 +323,28 @@ def untile(image, *, views: int = len(LEROBOT_VIEWS)) -> list:
 
 
 @dataclass
-class SmolVlaMethod:
-    """`lerobot/smolvla_robocasa` behind the study's method contract.
+class SmolVlaPolicy:
+    """`lerobot/smolvla_robocasa` as a `Flow[PolicyObservation, ActionChunk]`.
 
-    The policy plans its own chunk — `n_action_steps` is 50 in the released
-    config — and this holds that queue, handing the harness `horizon` rows per
-    call. So one model call covers up to 50 control steps, and the study's
-    model-call count stays the honest measure of what the policy cost.
+    This is the shape Retriever expects of a policy, so the study measures a
+    policy written against the framework's contract rather than a class that
+    happens to live here. `step` returns the checkpoint's **whole** proposal —
+    `n_action_steps` is 50 in the released config — and truncating it to the
+    benchmark's re-planning cadence is the adapter's job, not the policy's. See
+    `study_flow_method.FlowMethod`.
+
+    Keeping the two apart is what makes the study's model-call count correct.
+    With the chunk held in a private queue and one row handed out per call, the
+    harness saw one dispatch per control step and reported 1,130 "model calls"
+    for an episode in which the policy was queried 23 times. The paper's metric
+    is calls per episode; this returns the real one.
     """
 
     checkpoint: str = DEFAULT_CHECKPOINT
-    horizon: int = 1
     source: str = "model"
     device: str = "cpu"
     #: Flip frames to the convention the checkpoint was trained under.
     flip_images: bool = FLIP_IMAGES
-    #: Actions consumed per inference before re-planning; the rest of the
-    #: predicted chunk is discarded, as the official client does.
-    replan_steps: int = REPLAN_STEPS
     policy: object = None
     calls: int = 0
     inferences: int = 0
@@ -351,15 +355,17 @@ class SmolVlaMethod:
     #: Which released statistic went into which normaliser buffer, recorded so
     #: a run shows the normaliser was populated rather than assumed.
     normalization: dict = field(default_factory=dict)
-    _queue: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if type(self.horizon) is not int or not 1 <= self.horizon <= 50:
-            raise ValueError("horizon must be an int from 1 through 50")
-        if type(self.replan_steps) is not int or not 1 <= self.replan_steps <= 50:
-            raise ValueError("replan_steps must be an int from 1 through 50")
         if not isinstance(self.checkpoint, str) or not self.checkpoint.strip():
             raise ValueError("checkpoint must be a non-empty string")
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError("device must be a non-empty string")
+
+    def init_config(self) -> dict:
+        """Enough to rebuild this policy from a serialised run record."""
+        return {"checkpoint": self.checkpoint, "device": self.device,
+                "flip_images": self.flip_images}
 
     def load(self) -> None:
         """Build the policy. Separate from `__init__` so import stays cheap."""
@@ -391,26 +397,19 @@ class SmolVlaMethod:
         self.policy = policy
 
     def reset(self) -> None:
-        self._queue.clear()
         if self.policy is not None and hasattr(self.policy, "reset"):
             self.policy.reset()
 
     # --- the harness contract ------------------------------------------
 
-    def predict(self, observation: PolicyObservation) -> ActionChunk:
+    def step(self, observation: PolicyObservation) -> ActionChunk:
+        """One inference, returning the checkpoint's whole action proposal."""
         self.calls += 1
-        rows = []
-        for _ in range(self.horizon):
-            if not self._queue:
-                # Keep only the leading `replan_steps` and discard the rest, so
-                # the policy is re-queried on a fresh observation at the
-                # official cadence.
-                self._queue.extend(self._infer(observation)[: self.replan_steps])
-            rows.append(self._queue.pop(0))
+        rows = self._infer(observation)
         actions = np.asarray(rows, dtype=np.float32)
         self.frozen_commands += int(
             np.count_nonzero(actions[:, list(FROZEN_LEROBOT_DIMS)]))
-        return ActionChunk(actions=actions, horizon=self.horizon,
+        return ActionChunk(actions=actions, horizon=int(actions.shape[0]),
                            dof=LEROBOT_ACTION_DOF, source=self.source)
 
     def _infer(self, observation: PolicyObservation) -> list:
@@ -456,11 +455,21 @@ class SmolVlaMethod:
     def describe(self) -> dict:
         return {"method": "smolvla", "checkpoint": self.checkpoint,
                 "training_dataset": TRAINING_DATASET, "privileged": False,
-                "horizon": self.horizon, "device": self.device,
-                "flip_images": self.flip_images,
-                "replan_steps": self.replan_steps,
+                "device": self.device, "flip_images": self.flip_images,
                 "source": self.source, "calls": self.calls,
                 "inferences": self.inferences,
                 "frozen_commands": self.frozen_commands,
                 "compat_shim": self.compat_shim,
                 "normalization": dict(self.normalization)}
+
+
+def smolvla_arm(*, take: int = REPLAN_STEPS, **kwargs):
+    """The released checkpoint as a study arm, at the benchmark's cadence.
+
+    `take` is the official client's `replan_steps`; pass `None` to let the
+    policy's whole 50-step proposal run open-loop, which is what this study
+    did before the protocol was read properly.
+    """
+    from .study_flow_method import FlowMethod
+
+    return FlowMethod(policy=SmolVlaPolicy(**kwargs), take=take)

@@ -57,12 +57,15 @@ def vla_specs(horizon: int) -> tuple:
     at 256 px, a 16-wide state, a 12-wide action in its own ordering — so none
     of them follow `--representation`.
     """
-    from .study_vla import SmolVlaMethod
+    from .study_vla import REPLAN_STEPS, smolvla_arm
 
+    # `horizon` does not apply: the checkpoint fixes its own 50-step proposal
+    # and the benchmark fixes how much of it runs before re-planning.
     return (
-        MethodSpec(method_id="smolvla", horizon=horizon, representation="lerobot_12",
-                   label="lerobot/smolvla_robocasa; a trained policy, not privileged",
-                   build=lambda env, h=horizon: SmolVlaMethod(horizon=h)),
+        MethodSpec(method_id="smolvla", horizon=REPLAN_STEPS,
+                   representation="lerobot_12",
+                   label="lerobot/smolvla_robocasa as a Flow; trained, not privileged",
+                   build=lambda env: smolvla_arm(take=REPLAN_STEPS)),
     )
 
 
