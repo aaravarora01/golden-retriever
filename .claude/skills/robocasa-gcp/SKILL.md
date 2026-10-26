@@ -73,7 +73,7 @@ under both. So the install on the VM is a download, not a resolve.
 
 ## Shape: a prepared image, then create and destroy
 
-Preparing the environment means a pixi solve plus about **13 GB of kitchen
+Preparing the environment means a pixi solve plus about **23 GB of kitchen
 assets**, which is far too slow to repeat per run. So it is done **once** into a
 reusable disk image; every run boots from that image, works, and is destroyed.
 That keeps create-and-destroy semantics without paying the download each time.
