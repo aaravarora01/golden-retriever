@@ -49,6 +49,28 @@ does not name its own cause.
 
 `verify` asserts all three rather than trusting them.
 
+## Checking the lock covers linux-64, and a trap in doing so
+
+`bootstrap.sh` runs `pixi install -e robocasa`, which installs from the
+committed solve rather than re-solving, so the VM gets the same versions as a
+local checkout. That only holds if the lock really carries a linux-64 solve for
+this environment, and verifying it has a trap worth knowing.
+
+```
+pixi list -e robocasa --platform linux-64   ->  0 packages     (misleading)
+```
+
+That reads as "no linux-64 solve" and is false. Pixi's lock format v7 **interns
+platform names**, so the linux-64 block sits under a key like `p1`. A regex, a
+`yaml.safe_load` and the CLI query above all report a platform literally named
+`p1`. The reliable check is to read the package URLs and see which platform
+they point at: every entry under the interned key is a
+`conda-forge/linux-64/...` URL.
+
+Measured on this repo: **osx-arm64 308 packages, linux-64 355**, with the
+robosuite and robocasa git pins, mujoco, torch, lerobot and transformers present
+under both. So the install on the VM is a download, not a resolve.
+
 ## Shape: a prepared image, then create and destroy
 
 Preparing the environment means a pixi solve plus about **13 GB of kitchen
