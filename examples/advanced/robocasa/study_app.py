@@ -17,6 +17,7 @@ import argparse
 
 from .study_methods import RandomMethod, StillMethod
 from .study_reference import ScriptedPickMethod
+from .study_representations import REPRESENTATION_DOF
 from .study_sweep import MethodSpec, Sweep, render
 from .study_tasks import (
     ATOMIC_SEEN_TASKS, DEFAULT_SEEDS, ablation_subset, get_task, list_tasks,
@@ -172,6 +173,11 @@ def main(argv=None) -> int:
                         help="Append finished episodes to this JSONL and resume from it. "
                              "A full sweep is hours long and the summary prints only at "
                              "the end, so an interruption otherwise loses everything.")
+    parser.add_argument("--preflight", action="store_true",
+                        help="Probe the policy against the environment for a few steps "
+                             "and stop unless every interface check passes. Every "
+                             "expensive mistake in this study was an interface "
+                             "disagreement that produced valid, useless behaviour.")
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args(argv)
 
@@ -227,6 +233,22 @@ def main(argv=None) -> int:
                    else ("scripted",))
         horizons = ({task: official_horizon(task) for task in tasks}
                     if args.official_horizons else {})
+        if args.preflight:
+            from . import study_preflight
+
+            spec = specs[0]
+            environment = build(tasks[0], spec.representation)
+            config = getattr(spec.build(environment), "config", None)
+            report = study_preflight.run(
+                environment=environment, method=spec.build(environment),
+                task=tasks[0], representation=spec.representation,
+                dof=REPRESENTATION_DOF[spec.representation], config=config)
+            try:
+                environment.close()
+            except Exception:  # noqa: BLE001 - cleanup must not mask the report
+                pass
+            print(render(report.to_dict()))
+            return 0 if report.ok else 1
         sweep = Sweep(build_environment=build, tasks=tasks,
                       seeds=tuple(args.seeds), max_steps=args.max_steps,
                       horizons=horizons, allowed_sources=sources,

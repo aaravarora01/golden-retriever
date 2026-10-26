@@ -71,6 +71,10 @@ class EpisodeResult:
     latency_s: float
     clip: dict
     backend: dict
+    #: What the method reports about itself — for a model arm, the refusal and
+    #: retry counts. Without it a zero score cannot be told apart from a run of
+    #: held no-motion actions, which are different findings.
+    method: dict = field(default_factory=dict)
     error: str = ""
 
     def to_dict(self) -> dict:
@@ -182,6 +186,31 @@ class Sweep:
         calls = sum(1 for event in report.events if event.kind == "chunk_dispatched")
         progress = getattr(environment, "progress", None)
         codec = getattr(environment, "codec", None)
+        described = {}
+        describe = getattr(method, "describe", None)
+        if callable(describe):
+            try:
+                value = describe()
+            except Exception:  # noqa: BLE001 - a method's own reporting must not lose a cell
+                value = None
+            if isinstance(value, dict):
+                described = {k: v for k, v in value.items()
+                             if isinstance(v, (int, float, str, bool, type(None)))}
+        for name in ("refusals", "last_refusal"):
+            if hasattr(method, name):
+                described.setdefault(name, getattr(method, name))
+        client = getattr(method, "client", None)
+        client_describe = getattr(client, "describe", None)
+        if callable(client_describe):
+            try:
+                value = client_describe()
+            except Exception:  # noqa: BLE001
+                value = None
+            if isinstance(value, dict):
+                described.update({f"client_{k}": v for k, v in value.items()
+                                  if isinstance(v, (int, float, str, bool, type(None)))})
+        # Captured before close(): a closed environment reports nothing.
+        backend_described = environment.describe()
         try:
             environment.close()
         except Exception:  # noqa: BLE001 - cleanup failure must not lose the result
@@ -194,7 +223,7 @@ class Sweep:
             control_steps=int(report.steps), model_calls=calls, horizon=spec.horizon,
             representation=spec.representation, latency_s=round(latency, 4),
             clip=codec.ledger.to_dict() if codec else {},
-            backend=environment.describe(), error=report.error)
+            backend=backend_described, method=described, error=report.error)
 
     def summarise(self) -> dict:
         per_method: dict = {}

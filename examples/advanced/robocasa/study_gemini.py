@@ -43,6 +43,16 @@ PREFERRED_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash")
 GATED_MODELS = ("gemini-robotics-er-2-preview", "gemini-3-pro-preview",
                 "gemini-3-flash-preview", "gemini-4-argon")
 DEFAULT_LOCATION = "us-central1"
+#: Retries for a rate-limited or briefly unavailable call, and the base of the
+#: exponential backoff between them.
+#:
+#: This exists because of how the two failure kinds differ. A refusal is the
+#: policy's behaviour and belongs in the results; a 429 is the provider saying
+#: "later" and belongs nowhere near them. Without a retry, running several
+#: episodes at once turns quota pressure into silent no-motion actions, and the
+#: run measures the quota rather than the model.
+MAX_RETRIES = 4
+BACKOFF_BASE_SECONDS = 2.0
 #: JPEG quality for the frame sent with each call. The observation is already
 #: small (a 256 px tile per view), so this trades almost nothing for a payload
 #: that does not dominate the request.
@@ -83,9 +93,14 @@ class GeminiClient:
     location: str = DEFAULT_LOCATION
     usd_per_1m_input: float | None = None
     usd_per_1m_output: float | None = None
+    max_retries: int = MAX_RETRIES
+    backoff_base: float = BACKOFF_BASE_SECONDS
     client: object = None
     calls: int = 0
     refusals: int = 0
+    #: Retries spent on rate limits, so a run can show whether it was throttled.
+    retries: int = 0
+    rate_limited: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
     #: Per-call statuses, so a run can show the refusal pattern rather than a
@@ -99,6 +114,10 @@ class GeminiClient:
             rate = getattr(self, name)
             if rate is not None and (type(rate) is not float or rate < 0.0):
                 raise ValueError(f"{name} must be None or a non-negative float")
+        if type(self.max_retries) is not int or not 0 <= self.max_retries <= 10:
+            raise ValueError("max_retries must be an int from 0 through 10")
+        if type(self.backoff_base) is not float or not 1.0 <= self.backoff_base <= 10.0:
+            raise ValueError("backoff_base must be a float from 1.0 through 10.0")
 
     # --- transport -----------------------------------------------------
 
@@ -135,21 +154,48 @@ class GeminiClient:
 
     # --- the ModelClient contract --------------------------------------
 
+    @staticmethod
+    def _retryable(error: Exception) -> bool:
+        """Whether the provider is saying "later" rather than "no"."""
+        text = str(error).lower()
+        return ("429" in text or "resource_exhausted" in text or "rate limit" in text
+                or "503" in text or "unavailable" in text)
+
     def complete(self, prompt: str, config: ModelConfig, *, images=()) -> ModelResponse:
         started = time.perf_counter()
         try:
             parts = self._parts(prompt, images)
             client = self._connect()
-            response = client.models.generate_content(
-                model=self.model_id, contents=parts,
-                config=self._request_config(config))
         except GeminiUnavailable as error:
             return self._record(ModelResponse(
                 status=ModelCallStatus.TRANSPORT_ERROR, model_id=self.model_id,
                 detail=str(error)[:300], latency_s=time.perf_counter() - started))
-        except Exception as error:  # noqa: BLE001 - every provider failure is a status
+        except Exception as error:  # noqa: BLE001 - a bad frame is this call's outcome
             return self._record(self._classify(error, started))
-        return self._record(self._unpack(response, config, started))
+        last = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=self.model_id, contents=parts,
+                    config=self._request_config(config))
+            except Exception as error:  # noqa: BLE001 - every failure is a status
+                last = error
+                if attempt < self.max_retries and self._retryable(error):
+                    self.retries += 1
+                    time.sleep(self.backoff_base ** attempt)
+                    continue
+                if self._retryable(error):
+                    # Exhausted: say so explicitly, because a throttled run that
+                    # reports plain transport errors looks like a weak policy.
+                    self.rate_limited += 1
+                    return self._record(ModelResponse(
+                        status=ModelCallStatus.TRANSPORT_ERROR, model_id=self.model_id,
+                        latency_s=time.perf_counter() - started,
+                        detail=f"rate limited after {self.max_retries} retries: "
+                               f"{type(error).__name__}: {error}"[:300]))
+                return self._record(self._classify(error, started))
+            return self._record(self._unpack(response, config, started))
+        return self._record(self._classify(last or RuntimeError("no attempt ran"), started))
 
     def _parts(self, prompt: str, images) -> list:
         from google.genai import types
@@ -249,4 +295,5 @@ class GeminiClient:
                 "refusals": self.refusals, "tokens_in": self.tokens_in,
                 "tokens_out": self.tokens_out,
                 "priced": self.usd_per_1m_input is not None,
+                "retries": self.retries, "rate_limited": self.rate_limited,
                 "gated_alternatives": list(GATED_MODELS)}

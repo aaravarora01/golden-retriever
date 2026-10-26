@@ -84,10 +84,14 @@ PROMPT_VARIANTS = {
 
 
 def example_rows(dof: int, *, rows: int = 2) -> str:
-    """A JSON example of the exact width asked for.
+    """A JSON example of the exact width asked for, at the real scale.
 
-    Generated rather than written out, because an example of the wrong width
-    silently overrides the stated one.
+    Generated rather than written out for two reasons, both measured. An
+    example of the wrong width silently overrides the stated one — a 7-wide
+    example beside a stated dof of 10 was answered with 7 values. And an
+    example at the wrong magnitude teaches the wrong magnitude, so the leading
+    value here is the codec's own per-step translation cap rather than a
+    plausible-looking 0.1.
     """
     if type(dof) is not int or not 1 <= dof <= 64:
         raise ValueError("dof must be an int from 1 through 64")
@@ -95,33 +99,58 @@ def example_rows(dof: int, *, rows: int = 2) -> str:
         raise ValueError("rows must be an int from 1 through 8")
     import json
 
+    from .study_representations import MAX_TRANSLATION_PER_STEP
+
     body = []
     for index in range(rows):
         row = [0.0] * dof
-        row[0] = round(0.1 * (index + 1), 2)
+        # At the cap, and half of it, so both the units and the bound are shown.
+        row[0] = round(MAX_TRANSLATION_PER_STEP / (index + 1), 4)
         row[-1] = -1.0
         body.append(row)
     return json.dumps(body, separators=(",", ":"))
 
 
 def layout_text(dof: int) -> str:
-    """Name each segment of a row, for the widths this study commands.
+    """Name each segment of a row, and state its physical scale.
 
-    An unknown width is described rather than guessed at, so an unsupported
-    representation produces a vague prompt instead of a confidently wrong one.
+    The scale is the part that cannot be left out. A prompt saying only that
+    values lie in [-1, 1] states the envelope's bound, not the units, and a
+    model told that asks for a metre when the per-step cap is two centimetres.
+    Measured: that prompt produced requests exceeding the cap by up to 0.84 m
+    and 75-93% of rows clipped, so the policy had direction but no magnitude
+    control, and scored zero on every one of eighteen tasks.
+
+    The figures are imported from the codec rather than written here, so the
+    prompt and the environment cannot drift apart. An unsupported width raises
+    instead of falling back to vague text: a prompt that does not describe the
+    action space is worse than a run that refuses to start.
     """
+    from .study_representations import MAX_ROTATION_PER_STEP, MAX_TRANSLATION_PER_STEP
+
+    scale = (f"Position values are metres and the total position change in one row "
+             f"must be at most {MAX_TRANSLATION_PER_STEP} m. Rotation values are "
+             f"radians and at most {MAX_ROTATION_PER_STEP} rad per row. Anything "
+             f"larger is clipped to those limits, so a row of large numbers moves "
+             f"no further than one of small ones and only wastes the step.")
     layouts = {
         7: ("Each row is 7 values: 3 end-effector position deltas, 3 end-effector "
-            "rotation deltas, then 1 gripper command where -1 is open and +1 is closed."),
-        8: ("Each row is 8 values: 7 arm joint deltas, then 1 gripper command where "
-            "-1 is open and +1 is closed."),
+            "rotation deltas, then 1 gripper command where -1 is open and +1 is "
+            f"closed. {scale}"),
+        8: ("Each row is 8 values: 7 arm joint deltas in radians, then 1 gripper "
+            "command where -1 is open and +1 is closed."),
         10: ("Each row is 10 values: 3 end-effector position deltas, 3 end-effector "
              "rotation deltas, 1 gripper command where -1 is open and +1 is closed, "
              "then 3 mobile-base values as forward, lateral and yaw. Use the base "
              "values to drive toward something out of the arm's reach, and leave "
-             "them at 0 while manipulating."),
+             f"them at 0 while manipulating. {scale}"),
     }
-    return layouts.get(dof, f"Each row is {dof} values describing one robot action.")
+    if dof not in layouts:
+        raise ValueError(
+            f"no action-space description for a {dof}-wide row; add one to "
+            "`layout_text` rather than prompting a model with an undescribed "
+            f"action space (described: {sorted(layouts)})")
+    return layouts[dof]
 
 REASONING_EFFORTS = ("none", "low", "medium", "high")
 #: The study's two horizon bands.

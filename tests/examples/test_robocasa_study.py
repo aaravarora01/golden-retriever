@@ -2328,3 +2328,295 @@ def test_the_official_horizons_are_per_task_and_in_range():
     assert all(450 <= v <= 1050 for v in values.values())
     # Not a flat cap - a single number would starve the long tasks.
     assert len(set(values.values())) > 1
+
+
+# --- the prompt is part of the interface ---------------------------------
+#
+# Every failure this section guards against was found by running a sweep, not
+# by a test: a prompt whose example was 7 wide beside a stated dof of 10, and a
+# prompt stating [-1, 1] when the codec's cap was 0.02 m. Both produced valid,
+# parseable, entirely useless actions — the shape of bug that looks like a weak
+# policy. The prompt is as much a part of the policy/environment contract as the
+# action width, and it is asserted here against the codec rather than by eye.
+
+
+@pytest.mark.parametrize("dof", [7, 8, 10])
+def test_the_prompt_example_has_exactly_the_stated_width(dof):
+    """A model answers with the example's width when the two disagree."""
+    import json as _json
+
+    from examples.advanced.robocasa.study_model import example_rows
+
+    rows = _json.loads(example_rows(dof))
+    assert rows, "an example with no rows teaches nothing"
+    assert all(len(row) == dof for row in rows), [len(r) for r in rows]
+
+
+@pytest.mark.parametrize("variant", ["with_format", "with_layout"])
+@pytest.mark.parametrize("dof", [7, 8, 10])
+def test_every_rendered_prompt_contains_a_correctly_sized_example(variant, dof):
+    import json as _json
+    import re
+
+    from examples.advanced.robocasa.study_model import ModelConfig
+
+    text = ModelConfig(model_id="m", prompt_variant=variant).instructions(dof=dof)
+    found = re.search(r"\[\[.*?\]\]", text, re.S)
+    assert found, "the prompt shows no example at all"
+    for row in _json.loads(found.group(0)):
+        assert len(row) == dof, f"{variant} example row is {len(row)} wide, stated {dof}"
+
+
+@pytest.mark.parametrize("dof", [7, 10])
+def test_the_prompt_states_the_codecs_real_limits(dof):
+    """The numbers in the prompt must be the codec's, not a second copy.
+
+    Measured consequence of them disagreeing: requests exceeding the cap by
+    0.84 m, 75-93% of rows clipped, and zero successes on all eighteen tasks.
+    """
+    from examples.advanced.robocasa.study_model import layout_text
+    from examples.advanced.robocasa.study_representations import (
+        MAX_ROTATION_PER_STEP, MAX_TRANSLATION_PER_STEP)
+
+    text = layout_text(dof)
+    assert str(MAX_TRANSLATION_PER_STEP) in text
+    assert str(MAX_ROTATION_PER_STEP) in text
+    assert "metre" in text and "radian" in text
+
+
+def test_the_prompt_example_is_inside_the_codecs_limits():
+    """An example above the cap teaches a magnitude that gets clipped away."""
+    import json as _json
+
+    import numpy as _np
+
+    from examples.advanced.robocasa.study_model import example_rows
+    from examples.advanced.robocasa.study_representations import (
+        MAX_TRANSLATION_PER_STEP)
+
+    for row in _json.loads(example_rows(10)):
+        assert _np.linalg.norm(row[:3]) <= MAX_TRANSLATION_PER_STEP + 1e-9
+
+
+def test_an_undescribed_action_width_refuses_rather_than_prompting_vaguely():
+    """A prompt that cannot describe the action space must not be sent."""
+    from examples.advanced.robocasa.study_model import layout_text
+
+    with pytest.raises(ValueError, match="no action-space description"):
+        layout_text(12)
+
+
+def test_a_prompt_at_the_codecs_scale_does_not_saturate_the_clip_ledger():
+    """The canary: a correctly-scaled action passes the codec unclipped.
+
+    If the prompt teaches the right magnitude, a policy following it is not
+    clipped. This pins the direction of the relationship, so a future prompt
+    regression shows up here rather than as a 75-minute sweep scoring zero.
+    """
+    import json as _json
+
+    import numpy as _np
+
+    from examples.advanced.robocasa.study_model import example_rows
+    from examples.advanced.robocasa.study_representations import EefDeltaCodec
+
+    codec = EefDeltaCodec("eef_delta_base")
+    for row in _json.loads(example_rows(10)):
+        out = codec.to_delta(_np.asarray(row, dtype=_np.float32),
+                             current_position=_np.zeros(3),
+                             current_rotation=_np.zeros(3))
+        assert out[:3].tolist() == pytest.approx(row[:3], abs=1e-6), "clipped"
+    assert codec.ledger.to_dict()["clipped_rows"] == 0
+
+
+def test_a_full_scale_action_does_saturate_and_is_visible():
+    """The other half: the ledger must actually notice over-scale requests.
+
+    Without this the canary above could pass against a ledger that never
+    reports anything.
+    """
+    import numpy as _np
+
+    from examples.advanced.robocasa.study_representations import EefDeltaCodec
+
+    codec = EefDeltaCodec("eef_delta_base")
+    row = _np.zeros(10, dtype=_np.float32)
+    row[0] = 1.0
+    codec.to_delta(row, current_position=_np.zeros(3), current_rotation=_np.zeros(3))
+    summary = codec.ledger.to_dict()
+    assert summary["clipped_rows"] == 1
+    assert summary["max_translation_excess_m"] > 0.9
+
+
+def test_the_model_arms_dof_matches_its_representation():
+    """The arm's dof and its representation's width must be the same number."""
+    from examples.advanced.robocasa.study_representations import REPRESENTATION_DOF
+
+    # The app builds the Agentic arm as eef_delta_base with dof=10.
+    assert REPRESENTATION_DOF["eef_delta_base"] == 10
+
+
+def test_a_cell_records_what_the_method_reports_about_itself():
+    """A zero score and a run of held no-motion actions look identical without this."""
+    from examples.advanced.robocasa.study_sweep import MethodSpec, Sweep
+
+    class _Reporting(StillMethod):
+        refusals = 7
+        last_refusal = "model call ended timeout"
+
+        def describe(self):
+            return {"method": "reporting", "refusals": self.refusals,
+                    "nested": {"dropped": True}}
+
+    sweep = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,))
+    summary = sweep.run((MethodSpec(method_id="m", horizon=2,
+                                    build=lambda env: _Reporting(horizon=2)),))
+    recorded = summary["episodes"][0]["method"]
+    assert recorded["refusals"] == 7
+    assert recorded["last_refusal"] == "model call ended timeout"
+    assert recorded["method"] == "reporting"
+    # Only scalars survive, so a record stays JSON-safe and byte-stable.
+    assert "nested" not in recorded
+
+
+def test_a_methods_broken_describe_does_not_lose_the_cell():
+    """Reporting is not worth an episode."""
+    from examples.advanced.robocasa.study_sweep import MethodSpec, Sweep
+
+    class _Broken(StillMethod):
+        def describe(self):
+            raise RuntimeError("no")
+
+    sweep = Sweep(build_environment=_build_fake, tasks=("T",), seeds=(0,))
+    summary = sweep.run((MethodSpec(method_id="m", horizon=2,
+                                    build=lambda env: _Broken(horizon=2)),))
+    assert summary["errors"] == 0
+    assert summary["episodes"][0]["method"] == {}
+
+
+# --- preflight: catch an interface disagreement before paying for it ------
+
+
+def test_preflight_catches_a_prompt_that_omits_the_action_scale():
+    """The exact failure that cost 75 minutes and scored zero on 18 tasks.
+
+    `with_format` states the envelope bound and not the codec's limits, so a
+    model following it asks for a metre where the cap is two centimetres. This
+    must fail the check; `with_layout`, which states the limits, must pass it.
+    """
+    from examples.advanced.robocasa.study_model import ModelConfig
+    from examples.advanced.robocasa.study_preflight import Preflight, check_prompt_contract
+
+    lax = Preflight()
+    check_prompt_contract(lax, config=ModelConfig(model_id="m",
+                                                  prompt_variant="with_format"), dof=10)
+    assert not lax.ok
+    assert "prompt states the codec's per-step limits" in lax.to_dict()["failed"]
+
+    strict = Preflight()
+    check_prompt_contract(strict, config=ModelConfig(model_id="m",
+                                                     prompt_variant="with_layout"), dof=10)
+    assert strict.ok, strict.to_dict()["failed"]
+
+
+def test_preflight_catches_a_width_mismatch():
+    from examples.advanced.robocasa.study_preflight import Preflight, check_action_width
+
+    bad = Preflight()
+    check_action_width(bad, representation="eef_delta_base", dof=7)
+    assert not bad.ok
+    good = Preflight()
+    check_action_width(good, representation="eef_delta_base", dof=10)
+    assert good.ok
+
+
+def test_preflight_catches_a_blind_policy():
+    """A blank frame is what a policy handed a placeholder actually receives."""
+    from examples.advanced.robocasa.study_preflight import Preflight, check_observation
+
+    class _Obs:
+        def __init__(self, image, state, prompt):
+            self.image, self.state, self.prompt = image, state, prompt
+
+    blank = Preflight()
+    check_observation(blank, observation=_Obs(np.zeros((8, 8, 3), np.uint8),
+                                              np.zeros(4), "go"))
+    assert "image is not blank" in blank.to_dict()["failed"]
+
+    real = Preflight()
+    check_observation(real, observation=_Obs(
+        (np.random.default_rng(0).random((8, 8, 3)) * 255).astype(np.uint8),
+        np.zeros(4), "go"))
+    assert real.ok, real.to_dict()["failed"]
+
+
+def test_preflight_catches_a_saturated_policy():
+    """75-93% clipped was the measured signature of the scale bug."""
+    from examples.advanced.robocasa.study_preflight import Preflight, check_saturation
+
+    hot = Preflight()
+    check_saturation(hot, clip={"clipped_fraction": 0.83, "max_translation_excess_m": 0.84})
+    assert not hot.ok
+    cool = Preflight()
+    check_saturation(cool, clip={"clipped_fraction": 0.0, "max_translation_excess_m": 0.0})
+    assert cool.ok
+    # A ledger that reports nothing must not read as a pass.
+    silent = Preflight()
+    check_saturation(silent, clip={})
+    assert not silent.ok
+
+
+def test_preflight_catches_a_policy_that_mostly_refuses():
+    """A refusal becomes a held no-motion action, indistinguishable from failure."""
+    from examples.advanced.robocasa.study_preflight import Preflight, check_calls
+
+    class _Method:
+        def __init__(self, calls, refusals):
+            self.calls, self.refusals = calls, refusals
+
+    bad = Preflight()
+    check_calls(bad, method=_Method(10, 9), steps=20)
+    assert not bad.ok
+    good = Preflight()
+    check_calls(good, method=_Method(10, 1), steps=20)
+    assert good.ok
+    never = Preflight()
+    check_calls(never, method=_Method(0, 0), steps=20)
+    assert "the policy was called" in never.to_dict()["failed"]
+
+
+def test_a_preflight_report_names_what_failed():
+    from examples.advanced.robocasa.study_preflight import Preflight
+
+    p = Preflight()
+    p.note("a", True)
+    p.note("b", False, "why")
+    out = p.to_dict()
+    assert out["ok"] is False
+    assert out["failed"] == ["b"]
+    assert out["findings"][1]["detail"] == "why"
+
+
+def test_preflight_finds_the_call_count_wherever_it_lives():
+    """A Flow adapter counts on itself; a model method counts on its client.
+
+    Reading the wrong attribute reports a working policy as never called, which
+    is exactly what happened the first time this check ran live.
+    """
+    from examples.advanced.robocasa.study_preflight import Preflight, check_calls
+
+    class _OnClient:
+        class client:  # noqa: N801 - a stand-in for the provider client
+            calls, refusals = 12, 0
+
+    on_client = Preflight()
+    check_calls(on_client, method=_OnClient(), steps=12)
+    assert on_client.ok, on_client.to_dict()["failed"]
+
+    class _OnLedger:
+        class ledger:  # noqa: N801
+            canonical = [{}] * 9
+
+    on_ledger = Preflight()
+    check_calls(on_ledger, method=_OnLedger(), steps=12)
+    assert on_ledger.ok, on_ledger.to_dict()["failed"]

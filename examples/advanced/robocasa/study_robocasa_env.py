@@ -166,6 +166,7 @@ class RoboCasaPnPEnvironment:
     specification: dict = field(default_factory=dict)
     _frames: list = field(default_factory=list)
     _last_success: bool = False
+    _scored: object = None
     _last_raw: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -228,6 +229,7 @@ class RoboCasaPnPEnvironment:
         else:
             self.arm, self.codec = None, EefDeltaCodec(self.representation)
         self.progress = ProgressTracker()
+        self._scored = None
         self._frames = []
         self._last_success = False
         # The instruction a policy receives is an axis, not a fixed string. The
@@ -382,6 +384,8 @@ class RoboCasaPnPEnvironment:
         scorer may read the object's pose, a policy may not.
         """
         self._last_raw = raw
+        if self._scored is None:
+            self._scored = self._scored_object() is not None
         # The task predicate applies to every task and is what the leaderboard
         # scores, so it is read first and unconditionally.
         self._last_success = bool(self.env._check_success())
@@ -412,10 +416,17 @@ class RoboCasaPnPEnvironment:
     def scored(self) -> bool:
         """Whether the partial-score ladder applies to this task.
 
+        Latched during the episode rather than computed on demand, because
+        `describe()` is called after `close()` and a closed environment has no
+        objects to inspect — which made this read False for every task,
+        including the five pick-and-place ones where the ladder did run.
+
         True for pick-and-place, false for the articulated and toggle tasks in
         the leaderboard's atomic-seen split, which have no single object to
         reach, grasp and lift. Binary success applies either way.
         """
+        if self._scored is not None:
+            return self._scored
         return self.env is not None and self._scored_object() is not None
 
     # --- what a run records about this backend -------------------------
