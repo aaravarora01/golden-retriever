@@ -70,6 +70,55 @@ def vla_specs(horizon: int, *, take: int | None = None) -> tuple:
     )
 
 
+def model_specs(*, model_id: str, memory: int, dof: int) -> tuple:
+    """A frontier model as the policy, in the paper's Agentic form.
+
+    Agentic is the form the Astranomy study reports its best result from, which
+    is why it is the one wired first. The representation is `eef_delta_base`:
+    a delta end-effector pose plus gripper plus base, which is the paper's own
+    action representation extended with the base this robot needs — several
+    atomic-seen tasks (`NavigateKitchen` most obviously) cannot be done without
+    it. The environment derives the control-mode flag, so the model is never
+    asked for a protocol detail it has no way to reason about.
+    """
+    from .study_gemini import GeminiClient
+    from .study_model import AgenticModelMethod, ModelConfig
+
+    def build(environment, _m=model_id, _mem=memory, _dof=dof):
+        return AgenticModelMethod(
+            client=GeminiClient(model_id=_m,
+                                # Published rates, so a run records real cost
+                                # per episode rather than leaving it absent.
+                                usd_per_1m_input=0.30, usd_per_1m_output=2.50),
+            # The most explicit prompt in the study's content axis: a row width
+            # the example contradicts is answered with the example's width.
+            config=ModelConfig(model_id=_m, horizon_band="short",
+                               prompt_variant="with_layout"),
+            dof=_dof, memory=_mem, source="model",
+            # A provider hiccup must not void an episode; the refusal is counted.
+            refusal_action="hold")
+
+    return (
+        MethodSpec(method_id=f"agentic:{model_id}", horizon=15,
+                   representation="eef_delta_base",
+                   label=f"{model_id} as an Agentic policy; memory={memory}",
+                   build=build),
+    )
+
+
+def model_observation():
+    """Two views at 256 px for a model that has to actually see.
+
+    The 128 px single view the baselines use is enough for a scripted policy
+    reading privileged state and far too little for a vision-language model.
+    Two views is also the study's prompt-geometry axis at its documented
+    setting.
+    """
+    from .study_robocasa_env import ObservationConfig
+
+    return ObservationConfig(views=("over_shoulder", "wrist"), history=0, image_size=256)
+
+
 def vla_observation():
     from .study_robocasa_env import ObservationConfig
     from .study_vla import LEROBOT_IMAGE_SIZE, LEROBOT_VIEWS
@@ -110,7 +159,12 @@ def main(argv=None) -> int:
     parser.add_argument("--take", type=int, default=None,
                         help="Actions consumed per inference by a Flow policy; the "
                              "official client uses 5. Omit to use that default.")
-    parser.add_argument("--methods", choices=("baselines", "reference", "vla", "both"),
+    parser.add_argument("--model-id", default="gemini-2.5-flash",
+                        help="Model for the Agentic arm. 2.5-flash measured 6.5 s per "
+                             "call against 2.5-pro's 35.4 s, and parsed more reliably.")
+    parser.add_argument("--memory", type=int, default=3,
+                        help="Previous calls described in the prompt; 0 is the Direct form.")
+    parser.add_argument("--methods", choices=("baselines", "reference", "vla", "model", "both"),
                         default="baselines",
                         help="Which arms to run. The reference is privileged and always "
                              "uses joint_delta, whatever --representation says.")
@@ -124,6 +178,11 @@ def main(argv=None) -> int:
     from .study_robocasa_env import RoboCasaPnPEnvironment
 
     def build(task, representation):
+        if representation == "eef_delta_base" and args.methods == "model":
+            return RoboCasaPnPEnvironment(
+                task=task, representation=representation, command_base=True,
+                observation=model_observation(),
+                specification_style=args.specification)
         if representation == "lerobot_12":
             # The checkpoint fixes its own observation and state format, and its
             # language conditioning is the task identifier unless asked
@@ -140,7 +199,11 @@ def main(argv=None) -> int:
 
     try:
         if args.tasks:
-            tasks = tuple(get_task(name).task for name in args.tasks)
+            # A named task may be one of this study's committed pick-and-place
+            # entries or one of the leaderboard's atomic-seen tasks, which are
+            # not all pick-and-place and so have no entry here.
+            tasks = tuple(name if name in ATOMIC_SEEN_TASKS else get_task(name).task
+                          for name in args.tasks)
         elif args.atomic_seen:
             tasks = ATOMIC_SEEN_TASKS
         elif args.vla_tasks:
@@ -156,9 +219,12 @@ def main(argv=None) -> int:
             specs += reference_specs(args.horizon)
         if args.methods == "vla":
             specs += vla_specs(args.horizon, take=args.take)
+        if args.methods == "model":
+            specs += model_specs(model_id=args.model_id, memory=args.memory, dof=10)
         # A model's output is admitted only when a model arm is actually in
         # the sweep, so the default stays scripted-only.
-        sources = ("scripted", "model") if args.methods == "vla" else ("scripted",)
+        sources = (("scripted", "model") if args.methods in ("vla", "model")
+                   else ("scripted",))
         horizons = ({task: official_horizon(task) for task in tasks}
                     if args.official_horizons else {})
         sweep = Sweep(build_environment=build, tasks=tasks,

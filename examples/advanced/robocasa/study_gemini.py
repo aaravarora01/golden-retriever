@@ -1,0 +1,252 @@
+"""A Gemini client for the study's model boundary, over Vertex AI.
+
+This is the one class `study_model` was built waiting for. With it, the study's
+Direct, Agentic and Orchestrated forms stop being plumbing with an offline
+stand-in and become the experiment the Astranomy study actually runs: a
+frontier model asked for low-level continuous control.
+
+**Why Vertex rather than an API key.** Vertex authenticates with the
+credentials `gcloud` already holds, so no key is read, stored or logged by this
+code, and nothing has to be added to the environment. `AGENTS.md` requires the
+default test path to need neither network nor keys, which is why every test for
+this module either builds the client without calling it or stubs the transport.
+
+**What it reports and what it does not.** Token counts come from the provider's
+own `usage_metadata`. Cost does not: prices change and are not discoverable from
+the API, so `usd` is `None` unless a caller supplies rates. Reporting a cost
+derived from a hardcoded guess would be worse than reporting none, because the
+study publishes USD per episode as a result.
+
+**Failures are statuses, not exceptions.** A timeout, an oversize answer, a
+safety refusal and a transport error each end the call with a recorded status,
+which is what lets the harness count refusals as a policy's behaviour instead of
+crashing the sweep. The one thing that would be dishonest is to let a failure
+look like an empty answer, so every status carries its provider detail.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from .study_model import ModelCallStatus, ModelConfig, ModelResponse
+
+#: Models reachable on this project, strongest first. `gemini-robotics-er-2`
+#: would be the apt choice — it is Google's embodied-reasoning model — but it is
+#: listed in the Vertex catalog and returns 404 without an allowlist, so it is
+#: recorded here as the access to request rather than silently unavailable.
+PREFERRED_MODELS = ("gemini-2.5-pro", "gemini-2.5-flash")
+#: Listed in the catalog but not callable without allowlisting. Kept so a run
+#: can report what it would have used.
+GATED_MODELS = ("gemini-robotics-er-2-preview", "gemini-3-pro-preview",
+                "gemini-3-flash-preview", "gemini-4-argon")
+DEFAULT_LOCATION = "us-central1"
+#: JPEG quality for the frame sent with each call. The observation is already
+#: small (a 256 px tile per view), so this trades almost nothing for a payload
+#: that does not dominate the request.
+JPEG_QUALITY = 90
+
+
+class GeminiUnavailable(RuntimeError):
+    """The provider library or project access is missing."""
+
+
+def encode_frame(image, *, quality: int = JPEG_QUALITY) -> bytes:
+    """JPEG-encode one RGB frame for transport."""
+    import cv2
+
+    frame = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("a frame must be (H, W, 3) uint8 RGB")
+    if type(quality) is not int or not 1 <= quality <= 100:
+        raise ValueError("quality must be an int from 1 through 100")
+    ok, buffer = cv2.imencode(".jpg", frame[:, :, ::-1],
+                              [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise ValueError("frame could not be encoded")
+    return bytes(buffer)
+
+
+@dataclass
+class GeminiClient:
+    """`study_model.ModelClient` over Vertex AI.
+
+    `usd_per_1m_input` / `usd_per_1m_output` are optional. Supplied, the client
+    reports a cost per call; omitted, it reports token counts and leaves cost
+    absent rather than inventing a rate.
+    """
+
+    model_id: str = PREFERRED_MODELS[0]
+    project: str = ""
+    location: str = DEFAULT_LOCATION
+    usd_per_1m_input: float | None = None
+    usd_per_1m_output: float | None = None
+    client: object = None
+    calls: int = 0
+    refusals: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    #: Per-call statuses, so a run can show the refusal pattern rather than a
+    #: single rate.
+    statuses: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_id, str) or not self.model_id.strip():
+            raise ValueError("model_id must be a non-empty string")
+        for name in ("usd_per_1m_input", "usd_per_1m_output"):
+            rate = getattr(self, name)
+            if rate is not None and (type(rate) is not float or rate < 0.0):
+                raise ValueError(f"{name} must be None or a non-negative float")
+
+    # --- transport -----------------------------------------------------
+
+    def _connect(self):
+        if self.client is not None:
+            return self.client
+        try:
+            from google import genai
+        except ImportError as error:  # pragma: no cover - environment-dependent
+            raise GeminiUnavailable(f"google-genai is not installed: {error}") from error
+        project = self.project or self._default_project()
+        if not project:
+            raise GeminiUnavailable(
+                "no GCP project; set `project=` or run `gcloud config set project`")
+        self.client = genai.Client(vertexai=True, project=project, location=self.location)
+        return self.client
+
+    @staticmethod
+    def _default_project() -> str:
+        import os
+        import subprocess
+
+        for key in ("GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"):
+            value = os.environ.get(key, "").strip()
+            if value:
+                return value
+        try:
+            done = subprocess.run(["gcloud", "config", "get-value", "project"],
+                                  capture_output=True, text=True, timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        value = (done.stdout or "").strip()
+        return "" if value in ("", "(unset)") else value
+
+    # --- the ModelClient contract --------------------------------------
+
+    def complete(self, prompt: str, config: ModelConfig, *, images=()) -> ModelResponse:
+        started = time.perf_counter()
+        try:
+            parts = self._parts(prompt, images)
+            client = self._connect()
+            response = client.models.generate_content(
+                model=self.model_id, contents=parts,
+                config=self._request_config(config))
+        except GeminiUnavailable as error:
+            return self._record(ModelResponse(
+                status=ModelCallStatus.TRANSPORT_ERROR, model_id=self.model_id,
+                detail=str(error)[:300], latency_s=time.perf_counter() - started))
+        except Exception as error:  # noqa: BLE001 - every provider failure is a status
+            return self._record(self._classify(error, started))
+        return self._record(self._unpack(response, config, started))
+
+    def _parts(self, prompt: str, images) -> list:
+        from google.genai import types
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+        parts = [types.Part.from_text(text=prompt)]
+        for frame in images:
+            parts.append(types.Part.from_bytes(data=encode_frame(frame),
+                                               mime_type="image/jpeg"))
+        return parts
+
+    def _request_config(self, config: ModelConfig):
+        from google.genai import types
+
+        return types.GenerateContentConfig(
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            # The provider's own deadline, so a hung call ends as a timeout
+            # status rather than stalling an episode.
+            http_options=types.HttpOptions(timeout=int(config.timeout_seconds * 1000)),
+        )
+
+    def _classify(self, error: Exception, started: float) -> ModelResponse:
+        text = str(error)
+        lowered = text.lower()
+        if "deadline" in lowered or "timeout" in lowered or "504" in lowered:
+            status = ModelCallStatus.TIMEOUT
+        elif "safety" in lowered or "blocked" in lowered or "permission" in lowered:
+            status = ModelCallStatus.REFUSED
+        else:
+            status = ModelCallStatus.TRANSPORT_ERROR
+        return ModelResponse(status=status, model_id=self.model_id,
+                             detail=f"{type(error).__name__}: {text}"[:300],
+                             latency_s=time.perf_counter() - started)
+
+    def _unpack(self, response, config: ModelConfig, started: float) -> ModelResponse:
+        latency = time.perf_counter() - started
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = getattr(usage, "prompt_token_count", None) if usage else None
+        completion_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+        text = ""
+        try:
+            text = response.text or ""
+        except Exception:  # noqa: BLE001 - a blocked answer has no text
+            text = ""
+        if not text.strip():
+            # An empty answer is a refusal, not an unparseable chunk: saying so
+            # keeps "the model would not answer" apart from "the model answered
+            # something invalid", which are different findings.
+            return ModelResponse(
+                status=ModelCallStatus.REFUSED, model_id=self.model_id,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                usd=self._usd(prompt_tokens, completion_tokens), latency_s=latency,
+                detail=f"empty answer; finish_reason={self._finish_reason(response)}")
+        if len(text.encode("utf-8")) > config.max_response_bytes:
+            return ModelResponse(
+                status=ModelCallStatus.OVERSIZE, model_id=self.model_id,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                usd=self._usd(prompt_tokens, completion_tokens), latency_s=latency,
+                detail=f"{len(text.encode('utf-8'))} bytes exceeds the configured bound")
+        return ModelResponse(
+            text=text, status=ModelCallStatus.OK, model_id=self.model_id,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            usd=self._usd(prompt_tokens, completion_tokens), latency_s=latency)
+
+    @staticmethod
+    def _finish_reason(response) -> str:
+        candidates = getattr(response, "candidates", None) or ()
+        for candidate in candidates:
+            reason = getattr(candidate, "finish_reason", None)
+            if reason is not None:
+                return str(reason)
+        return "unknown"
+
+    def _usd(self, prompt_tokens, completion_tokens) -> float | None:
+        """Cost, only when rates were supplied. See the module docstring."""
+        if self.usd_per_1m_input is None or self.usd_per_1m_output is None:
+            return None
+        if prompt_tokens is None or completion_tokens is None:
+            return None
+        return round(prompt_tokens / 1e6 * self.usd_per_1m_input
+                     + completion_tokens / 1e6 * self.usd_per_1m_output, 8)
+
+    def _record(self, response: ModelResponse) -> ModelResponse:
+        self.calls += 1
+        self.statuses.append(response.status.value)
+        if response.status is not ModelCallStatus.OK:
+            self.refusals += 1
+        self.tokens_in += int(response.prompt_tokens or 0)
+        self.tokens_out += int(response.completion_tokens or 0)
+        return response
+
+    def describe(self) -> dict:
+        return {"client": "gemini-vertex", "model_id": self.model_id,
+                "location": self.location, "calls": self.calls,
+                "refusals": self.refusals, "tokens_in": self.tokens_in,
+                "tokens_out": self.tokens_out,
+                "priced": self.usd_per_1m_input is not None,
+                "gated_alternatives": list(GATED_MODELS)}
