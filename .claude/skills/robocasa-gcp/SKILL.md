@@ -87,6 +87,35 @@ collect       per run                     results to GCS and back
 teardown      per run                     always, even on failure
 ```
 
+## First run, for anyone with their own Google Cloud account
+
+Nothing here is shared between users: the image lives in whichever project your
+`gcloud` points at, so you build your own once. That means no credentials pass
+between people and nobody needs access to anyone else's project.
+
+```bash
+S=.claude/skills/robocasa-gcp/scripts
+
+gcloud auth login                            # the CLI
+gcloud auth application-default login        # what the policy client uses
+gcloud config set project YOUR_PROJECT_ID
+
+bash $S/doctor.sh --enable-apis              # checks, and enables what is missing
+bash $S/build_image.sh                       # once, ~45 min
+```
+
+`doctor.sh` is the thing to run when something is wrong. It checks gcloud,
+login, application default credentials, the project, billing, the three required
+APIs, and whether your image exists — and prints the exact command for anything
+missing. It changes nothing unless you pass `--enable-apis`.
+
+One check there is less obvious than it looks: it calls
+`gcloud auth print-access-token` rather than reading the config, because a
+*stale* refresh token still shows a logged-in account while every Vertex call
+returns `404 Publisher model ... not found`. That reads as "the model does not
+exist" and is really "your credentials expired", and it cost an hour to
+diagnose once already.
+
 ## Commands
 
 Scripts live in `scripts/`. Every one is idempotent and prints what it will do
